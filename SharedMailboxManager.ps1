@@ -38,6 +38,9 @@ param(
     [string]$SharePointListName = "SharedMailboxesMapping"
 )
 
+# Set execution policy to allow running unsigned scripts (current process only)
+Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+
 #region Module Installation and Connection Functions
 
 function Install-RequiredModules {
