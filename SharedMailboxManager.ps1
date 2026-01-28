@@ -80,12 +80,18 @@ function Connect-RequiredServices {
 
     if ($ConnectExchange) {
         Write-Host "Connecting to Exchange Online..." -ForegroundColor Cyan
-        try {
-            Get-ConnectionInformation -ErrorAction Stop | Out-Null
+        $connectionInfo = Get-ConnectionInformation -ErrorAction SilentlyContinue
+        if ($connectionInfo) {
             Write-Host "Already connected to Exchange Online" -ForegroundColor Green
         }
-        catch {
+        else {
             Connect-ExchangeOnline -ShowBanner:$false
+            # Verify connection was successful
+            $connectionInfo = Get-ConnectionInformation -ErrorAction SilentlyContinue
+            if (-not $connectionInfo) {
+                throw "Failed to connect to Exchange Online. Please check your credentials and try again."
+            }
+            Write-Host "Successfully connected to Exchange Online" -ForegroundColor Green
         }
     }
 
