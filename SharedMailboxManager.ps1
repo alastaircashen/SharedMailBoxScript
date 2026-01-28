@@ -102,12 +102,16 @@ function Connect-RequiredServices {
             "GroupMember.ReadWrite.All",
             "User.Read.All"
         )
-        Connect-MgGraph -Scopes $graphScopes -NoWelcome
+        # Use device code authentication to avoid MSAL version conflicts
+        Connect-MgGraph -Scopes $graphScopes -UseDeviceCode -NoWelcome
+        Write-Host "Successfully connected to Microsoft Graph" -ForegroundColor Green
     }
 
     if ($ConnectSharePoint -and $SharePointUrl) {
         Write-Host "Connecting to SharePoint Online..." -ForegroundColor Cyan
-        Connect-PnPOnline -Url $SharePointUrl -Interactive
+        # Use device login to avoid MSAL version conflicts
+        Connect-PnPOnline -Url $SharePointUrl -DeviceLogin
+        Write-Host "Successfully connected to SharePoint Online" -ForegroundColor Green
     }
 }
 
