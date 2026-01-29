@@ -7,6 +7,8 @@
     Step 1: Export all shared mailboxes and their send permissions to a CSV file
     Step 2: Import the CSV, create security groups, assign permissions, and update SharePoint
 
+    Uses only ExchangeOnlineManagement and PnP.PowerShell modules.
+
 .PARAMETER Step
     Specify which step to run: 'Export', 'Import', or 'Both'
 
@@ -41,12 +43,7 @@ param(
 # Set execution policy to allow running unsigned scripts (current process only)
 Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
 
-#region Global Variables
-$script:GraphToken = $null
-$script:SharePointToken = $null
-#endregion
-
-#region Module and Authentication Functions
+#region Module Installation and Connection Functions
 
 function Install-RequiredModules {
     <#
@@ -55,7 +52,7 @@ function Install-RequiredModules {
     #>
     $modules = @(
         'ExchangeOnlineManagement',
-        'MSAL.PS'
+        'PnP.PowerShell'
     )
 
     foreach ($module in $modules) {
@@ -66,63 +63,6 @@ function Install-RequiredModules {
         else {
             Write-Host "Module already installed: $module" -ForegroundColor Green
         }
-    }
-}
-
-function Get-GraphAccessToken {
-    <#
-    .SYNOPSIS
-        Gets an access token for Microsoft Graph using device code flow.
-    #>
-    Write-Host "Authenticating to Microsoft Graph..." -ForegroundColor Cyan
-    Write-Host "A browser window will open for authentication." -ForegroundColor Yellow
-
-    # Use Azure AD PowerShell app ID (well-known) for device code flow
-    $clientId = "1950a258-227b-4e31-a9cf-717495945fc2"  # Azure PowerShell
-    $tenantId = "organizations"
-    $scope = "https://graph.microsoft.com/.default"
-
-    try {
-        $tokenResponse = Get-MsalToken -ClientId $clientId -TenantId $tenantId -Scopes $scope -DeviceCode
-        $script:GraphToken = $tokenResponse.AccessToken
-        Write-Host "Successfully authenticated to Microsoft Graph" -ForegroundColor Green
-        return $true
-    }
-    catch {
-        Write-Error "Failed to get Graph token: $_"
-        return $false
-    }
-}
-
-function Get-SharePointAccessToken {
-    <#
-    .SYNOPSIS
-        Gets an access token for SharePoint using device code flow.
-    #>
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$SharePointUrl
-    )
-
-    Write-Host "Authenticating to SharePoint..." -ForegroundColor Cyan
-
-    # Extract tenant name from SharePoint URL
-    $uri = [System.Uri]$SharePointUrl
-    $sharePointResource = "https://$($uri.Host)"
-
-    $clientId = "1950a258-227b-4e31-a9cf-717495945fc2"  # Azure PowerShell
-    $tenantId = "organizations"
-    $scope = "$sharePointResource/.default"
-
-    try {
-        $tokenResponse = Get-MsalToken -ClientId $clientId -TenantId $tenantId -Scopes $scope -DeviceCode
-        $script:SharePointToken = $tokenResponse.AccessToken
-        Write-Host "Successfully authenticated to SharePoint" -ForegroundColor Green
-        return $true
-    }
-    catch {
-        Write-Error "Failed to get SharePoint token: $_"
-        return $false
     }
 }
 
@@ -146,6 +86,35 @@ function Connect-ExchangeOnlineService {
     }
 }
 
+function Connect-PnPService {
+    <#
+    .SYNOPSIS
+        Connects to PnP PowerShell for Microsoft 365 operations.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SiteUrl
+    )
+
+    Write-Host "Connecting to PnP PowerShell..." -ForegroundColor Cyan
+
+    try {
+        # Check if already connected
+        $currentConnection = Get-PnPConnection -ErrorAction SilentlyContinue
+        if ($currentConnection -and $currentConnection.Url -eq $SiteUrl) {
+            Write-Host "Already connected to PnP PowerShell" -ForegroundColor Green
+            return
+        }
+    }
+    catch {
+        # Not connected, proceed with connection
+    }
+
+    # Connect with interactive login - this handles both Graph and SharePoint
+    Connect-PnPOnline -Url $SiteUrl -Interactive
+    Write-Host "Successfully connected to PnP PowerShell" -ForegroundColor Green
+}
+
 function Disconnect-Services {
     <#
     .SYNOPSIS
@@ -153,257 +122,7 @@ function Disconnect-Services {
     #>
     Write-Host "Disconnecting from services..." -ForegroundColor Cyan
     try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue } catch { }
-    $script:GraphToken = $null
-    $script:SharePointToken = $null
-}
-
-#endregion
-
-#region Microsoft Graph REST API Functions
-
-function Invoke-GraphRequest {
-    <#
-    .SYNOPSIS
-        Makes a REST API call to Microsoft Graph.
-    #>
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Endpoint,
-
-        [Parameter(Mandatory = $false)]
-        [ValidateSet('GET', 'POST', 'PATCH', 'DELETE')]
-        [string]$Method = 'GET',
-
-        [Parameter(Mandatory = $false)]
-        [object]$Body = $null
-    )
-
-    $headers = @{
-        'Authorization' = "Bearer $($script:GraphToken)"
-        'Content-Type'  = 'application/json'
-    }
-
-    $uri = "https://graph.microsoft.com/v1.0$Endpoint"
-
-    $params = @{
-        Uri     = $uri
-        Headers = $headers
-        Method  = $Method
-    }
-
-    if ($Body) {
-        $params['Body'] = ($Body | ConvertTo-Json -Depth 10)
-    }
-
-    return Invoke-RestMethod @params
-}
-
-function Get-GraphGroup {
-    <#
-    .SYNOPSIS
-        Gets a group by display name from Microsoft Graph.
-    #>
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$DisplayName
-    )
-
-    $encodedName = [System.Web.HttpUtility]::UrlEncode("displayName eq '$DisplayName'")
-    $result = Invoke-GraphRequest -Endpoint "/groups?`$filter=$encodedName"
-    return $result.value | Select-Object -First 1
-}
-
-function New-GraphSecurityGroup {
-    <#
-    .SYNOPSIS
-        Creates a new security group via Microsoft Graph.
-    #>
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$DisplayName,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Description
-    )
-
-    # Check if group already exists
-    $existingGroup = Get-GraphGroup -DisplayName $DisplayName
-    if ($existingGroup) {
-        Write-Warning "Group '$DisplayName' already exists with ID: $($existingGroup.id)"
-        return $existingGroup
-    }
-
-    $mailNickname = $DisplayName -replace '[^a-zA-Z0-9]', ''
-    if ($mailNickname.Length -gt 64) {
-        $mailNickname = $mailNickname.Substring(0, 64)
-    }
-
-    $body = @{
-        displayName     = $DisplayName
-        description     = $Description
-        mailEnabled     = $false
-        mailNickname    = $mailNickname
-        securityEnabled = $true
-        groupTypes      = @()
-    }
-
-    $newGroup = Invoke-GraphRequest -Endpoint "/groups" -Method POST -Body $body
-    Write-Host "Created security group: $DisplayName (ID: $($newGroup.id))" -ForegroundColor Green
-    return $newGroup
-}
-
-function Get-GraphUser {
-    <#
-    .SYNOPSIS
-        Gets a user by email from Microsoft Graph.
-    #>
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Email
-    )
-
-    try {
-        $encodedFilter = [System.Web.HttpUtility]::UrlEncode("mail eq '$Email' or userPrincipalName eq '$Email'")
-        $result = Invoke-GraphRequest -Endpoint "/users?`$filter=$encodedFilter"
-        return $result.value | Select-Object -First 1
-    }
-    catch {
-        return $null
-    }
-}
-
-function Add-GraphGroupMember {
-    <#
-    .SYNOPSIS
-        Adds a user to a group via Microsoft Graph.
-    #>
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$GroupId,
-
-        [Parameter(Mandatory = $true)]
-        [string]$UserId
-    )
-
-    $body = @{
-        "@odata.id" = "https://graph.microsoft.com/v1.0/directoryObjects/$UserId"
-    }
-
-    Invoke-GraphRequest -Endpoint "/groups/$GroupId/members/`$ref" -Method POST -Body $body
-}
-
-function Get-GraphGroupMembers {
-    <#
-    .SYNOPSIS
-        Gets members of a group via Microsoft Graph.
-    #>
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$GroupId
-    )
-
-    $result = Invoke-GraphRequest -Endpoint "/groups/$GroupId/members"
-    return $result.value
-}
-
-#endregion
-
-#region SharePoint REST API Functions
-
-function Invoke-SharePointRequest {
-    <#
-    .SYNOPSIS
-        Makes a REST API call to SharePoint.
-    #>
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$SiteUrl,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Endpoint,
-
-        [Parameter(Mandatory = $false)]
-        [ValidateSet('GET', 'POST', 'PATCH', 'DELETE')]
-        [string]$Method = 'GET',
-
-        [Parameter(Mandatory = $false)]
-        [object]$Body = $null
-    )
-
-    $headers = @{
-        'Authorization' = "Bearer $($script:SharePointToken)"
-        'Accept'        = 'application/json;odata=verbose'
-        'Content-Type'  = 'application/json;odata=verbose'
-    }
-
-    $uri = "$SiteUrl/_api$Endpoint"
-
-    $params = @{
-        Uri     = $uri
-        Headers = $headers
-        Method  = $Method
-    }
-
-    if ($Body) {
-        $params['Body'] = ($Body | ConvertTo-Json -Depth 10)
-    }
-
-    return Invoke-RestMethod @params
-}
-
-function Get-SharePointListItemType {
-    <#
-    .SYNOPSIS
-        Gets the list item type for a SharePoint list.
-    #>
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$SiteUrl,
-
-        [Parameter(Mandatory = $true)]
-        [string]$ListName
-    )
-
-    $result = Invoke-SharePointRequest -SiteUrl $SiteUrl -Endpoint "/web/lists/getbytitle('$ListName')?`$select=ListItemEntityTypeFullName"
-    return $result.d.ListItemEntityTypeFullName
-}
-
-function Add-SharePointListItem {
-    <#
-    .SYNOPSIS
-        Adds an item to a SharePoint list.
-    #>
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$SiteUrl,
-
-        [Parameter(Mandatory = $true)]
-        [string]$ListName,
-
-        [Parameter(Mandatory = $true)]
-        [string]$SharedMailboxId,
-
-        [Parameter(Mandatory = $true)]
-        [string]$SecurityGroupId
-    )
-
-    try {
-        $listItemType = Get-SharePointListItemType -SiteUrl $SiteUrl -ListName $ListName
-
-        $body = @{
-            '__metadata'    = @{ 'type' = $listItemType }
-            'SharedMailbox' = $SharedMailboxId
-            'SecurityGroup' = $SecurityGroupId
-        }
-
-        $result = Invoke-SharePointRequest -SiteUrl $SiteUrl -Endpoint "/web/lists/getbytitle('$ListName')/items" -Method POST -Body $body
-        Write-Host "Created SharePoint list item for mailbox: $SharedMailboxId" -ForegroundColor Green
-        return $true
-    }
-    catch {
-        Write-Warning "Failed to add SharePoint list item: $_"
-        return $false
-    }
+    try { Disconnect-PnPOnline -ErrorAction SilentlyContinue } catch { }
 }
 
 #endregion
@@ -524,10 +243,50 @@ function Export-SharedMailboxData {
 
 #region Step 2: Import and Create Functions
 
+function Get-OrCreateSecurityGroup {
+    <#
+    .SYNOPSIS
+        Gets an existing security group or creates a new one using PnP PowerShell.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DisplayName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Description
+    )
+
+    try {
+        # Check if group already exists
+        $existingGroup = Get-PnPAzureADGroup -Filter "displayName eq '$DisplayName'" -ErrorAction SilentlyContinue
+
+        if ($existingGroup) {
+            Write-Warning "Group '$DisplayName' already exists with ID: $($existingGroup.Id)"
+            return $existingGroup
+        }
+
+        # Create mail nickname (alphanumeric only)
+        $mailNickname = $DisplayName -replace '[^a-zA-Z0-9]', ''
+        if ($mailNickname.Length -gt 64) {
+            $mailNickname = $mailNickname.Substring(0, 64)
+        }
+
+        # Create new security group (mail-disabled)
+        $newGroup = New-PnPAzureADGroup -DisplayName $DisplayName -Description $Description -MailNickname $mailNickname -IsSecurityEnabled -MailEnabled:$false
+
+        Write-Host "Created security group: $DisplayName (ID: $($newGroup.Id))" -ForegroundColor Green
+        return $newGroup
+    }
+    catch {
+        Write-Error "Failed to create group '$DisplayName': $_"
+        return $null
+    }
+}
+
 function Add-UsersToSecurityGroup {
     <#
     .SYNOPSIS
-        Adds users to a security group using Graph API.
+        Adds users to a security group using PnP PowerShell.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -541,17 +300,28 @@ function Add-UsersToSecurityGroup {
     $failedCount = 0
 
     # Get existing members
-    $existingMembers = Get-GraphGroupMembers -GroupId $GroupId
-    $existingMemberIds = $existingMembers | ForEach-Object { $_.id }
+    $existingMembers = Get-PnPAzureADGroupMember -Identity $GroupId -ErrorAction SilentlyContinue
+    $existingMemberUpns = @()
+    if ($existingMembers) {
+        $existingMemberUpns = $existingMembers | ForEach-Object { $_.UserPrincipalName.ToLower() }
+    }
 
     foreach ($email in $UserEmails) {
         if ([string]::IsNullOrWhiteSpace($email)) {
             continue
         }
 
+        $emailLower = $email.ToLower()
+
         try {
+            # Check if user is already a member
+            if ($existingMemberUpns -contains $emailLower) {
+                Write-Host "User $email is already a member of the group" -ForegroundColor Yellow
+                continue
+            }
+
             # Get user by email
-            $user = Get-GraphUser -Email $email
+            $user = Get-PnPAzureADUser -Filter "mail eq '$email' or userPrincipalName eq '$email'" -ErrorAction SilentlyContinue | Select-Object -First 1
 
             if (-not $user) {
                 Write-Warning "User not found: $email"
@@ -559,14 +329,8 @@ function Add-UsersToSecurityGroup {
                 continue
             }
 
-            # Check if user is already a member
-            if ($existingMemberIds -contains $user.id) {
-                Write-Host "User $email is already a member of the group" -ForegroundColor Yellow
-                continue
-            }
-
             # Add user to group
-            Add-GraphGroupMember -GroupId $GroupId -UserId $user.id
+            Add-PnPAzureADGroupMember -Identity $GroupId -Users $user.UserPrincipalName
             Write-Host "Added $email to group" -ForegroundColor Green
             $addedCount++
         }
@@ -607,6 +371,51 @@ function Set-GroupMailboxPermission {
     }
 }
 
+function Update-SharePointList {
+    <#
+    .SYNOPSIS
+        Adds or updates an item in the SharePoint list using PnP PowerShell.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ListName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SharedMailboxId,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SecurityGroupId
+    )
+
+    try {
+        # Check if item already exists
+        $existingItems = Get-PnPListItem -List $ListName -Query "<View><Query><Where><Eq><FieldRef Name='SharedMailbox'/><Value Type='Text'>$SharedMailboxId</Value></Eq></Where></Query></View>" -ErrorAction SilentlyContinue
+
+        if ($existingItems -and $existingItems.Count -gt 0) {
+            # Update existing item
+            $existingItem = $existingItems | Select-Object -First 1
+            Set-PnPListItem -List $ListName -Identity $existingItem.Id -Values @{
+                "SecurityGroup" = $SecurityGroupId
+            } | Out-Null
+            Write-Host "Updated SharePoint list item for mailbox: $SharedMailboxId" -ForegroundColor Green
+        }
+        else {
+            # Create new item
+            Add-PnPListItem -List $ListName -Values @{
+                "SharedMailbox"  = $SharedMailboxId
+                "SecurityGroup"  = $SecurityGroupId
+            } | Out-Null
+            Write-Host "Created SharePoint list item for mailbox: $SharedMailboxId" -ForegroundColor Green
+        }
+
+        return $true
+    }
+    catch {
+        Write-Warning "Failed to update SharePoint list: $_"
+        return $false
+    }
+}
+
 function Import-AndProcessMailboxData {
     <#
     .SYNOPSIS
@@ -615,9 +424,6 @@ function Import-AndProcessMailboxData {
     param(
         [Parameter(Mandatory = $true)]
         [string]$CsvPath,
-
-        [Parameter(Mandatory = $true)]
-        [string]$SharePointSiteUrl,
 
         [Parameter(Mandatory = $true)]
         [string]$SharePointListName
@@ -651,7 +457,7 @@ function Import-AndProcessMailboxData {
 
         # Step 1: Create security group
         $description = "Security group for shared mailbox: $($row.'Mailbox address')"
-        $group = New-GraphSecurityGroup -DisplayName $row.'M365 Group Name' -Description $description
+        $group = Get-OrCreateSecurityGroup -DisplayName $row.'M365 Group Name' -Description $description
 
         if (-not $group) {
             Write-Warning "Skipping mailbox $($row.'Mailbox address') due to group creation failure"
@@ -661,7 +467,7 @@ function Import-AndProcessMailboxData {
         # Step 2: Add users to the group
         if ($row.Members) {
             $members = $row.Members -split ";"
-            $result = Add-UsersToSecurityGroup -GroupId $group.id -UserEmails $members
+            $result = Add-UsersToSecurityGroup -GroupId $group.Id -UserEmails $members
             Write-Host "Added $($result.Added) users, $($result.Failed) failed" -ForegroundColor Yellow
         }
         else {
@@ -672,10 +478,10 @@ function Import-AndProcessMailboxData {
         $permissionGranted = Set-GroupMailboxPermission -MailboxIdentity $row.'Mailbox address' -GroupName $row.'M365 Group Name'
 
         # Step 4: Update SharePoint list
-        $spUpdated = Add-SharePointListItem -SiteUrl $SharePointSiteUrl -ListName $SharePointListName -SharedMailboxId $row.'MailboxID' -SecurityGroupId $group.id
+        $spUpdated = Update-SharePointList -ListName $SharePointListName -SharedMailboxId $row.'MailboxID' -SecurityGroupId $group.Id
 
         # Step 5: Update the CSV row
-        $row.'M365 Group ID' = $group.id
+        $row.'M365 Group ID' = $group.Id
         if ($permissionGranted -and $spUpdated) {
             $row.'Status' = "Created"
         }
@@ -695,9 +501,6 @@ function Import-AndProcessMailboxData {
 
 #region Main Execution
 
-# Add System.Web assembly for URL encoding
-Add-Type -AssemblyName System.Web
-
 # Main script execution
 try {
     Write-Host "==================================================" -ForegroundColor Cyan
@@ -711,7 +514,7 @@ try {
 
     # Import modules
     Import-Module ExchangeOnlineManagement -ErrorAction Stop
-    Import-Module MSAL.PS -ErrorAction Stop
+    Import-Module PnP.PowerShell -ErrorAction Stop
 
     switch ($Step) {
         'Export' {
@@ -726,39 +529,25 @@ try {
             # Connect to Exchange Online
             Connect-ExchangeOnlineService
 
-            # Get Graph token
-            if (-not (Get-GraphAccessToken)) {
-                throw "Failed to authenticate to Microsoft Graph"
-            }
-
-            # Get SharePoint token
-            if (-not (Get-SharePointAccessToken -SharePointUrl $SharePointSiteUrl)) {
-                throw "Failed to authenticate to SharePoint"
-            }
+            # Connect to PnP for Graph and SharePoint operations
+            Connect-PnPService -SiteUrl $SharePointSiteUrl
 
             # Import and process
-            Import-AndProcessMailboxData -CsvPath $CsvPath -SharePointSiteUrl $SharePointSiteUrl -SharePointListName $SharePointListName
+            Import-AndProcessMailboxData -CsvPath $CsvPath -SharePointListName $SharePointListName
         }
 
         'Both' {
             # Connect to Exchange Online
             Connect-ExchangeOnlineService
 
-            # Get Graph token
-            if (-not (Get-GraphAccessToken)) {
-                throw "Failed to authenticate to Microsoft Graph"
-            }
-
-            # Get SharePoint token
-            if (-not (Get-SharePointAccessToken -SharePointUrl $SharePointSiteUrl)) {
-                throw "Failed to authenticate to SharePoint"
-            }
+            # Connect to PnP for Graph and SharePoint operations
+            Connect-PnPService -SiteUrl $SharePointSiteUrl
 
             # Export first
             Export-SharedMailboxData -OutputPath $CsvPath
 
             # Then import and process
-            Import-AndProcessMailboxData -CsvPath $CsvPath -SharePointSiteUrl $SharePointSiteUrl -SharePointListName $SharePointListName
+            Import-AndProcessMailboxData -CsvPath $CsvPath -SharePointListName $SharePointListName
         }
     }
 
