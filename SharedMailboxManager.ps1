@@ -48,7 +48,7 @@ param(
     [string]$SharePointSiteUrl = "https://zn8r8.sharepoint.com/sites/DMData",
 
     [Parameter(Mandatory = $false)]
-    [string]$SharePointListName = "SharedMailboxesMapping"
+    [string]$SharePointListName = "Shared Mailboxes Mapping"
 )
 
 # Set execution policy to allow running unsigned scripts (current process only)
@@ -264,13 +264,17 @@ function Get-OrCreateSecurityGroup {
     <#
     .SYNOPSIS
         Gets an existing security group or creates a new one using PnP PowerShell Graph API.
+        If group exists, compares members to expected list.
     #>
     param(
         [Parameter(Mandatory = $true)]
         [string]$DisplayName,
 
         [Parameter(Mandatory = $true)]
-        [string]$Description
+        [string]$Description,
+
+        [Parameter(Mandatory = $false)]
+        [string[]]$ExpectedMembers = @()
     )
 
     try {
@@ -280,10 +284,54 @@ function Get-OrCreateSecurityGroup {
 
         if ($existingGroups -and $existingGroups.value -and $existingGroups.value.Count -gt 0) {
             $existingGroup = $existingGroups.value[0]
-            Write-Warning "Group '$DisplayName' already exists with ID: $($existingGroup.id)"
+            Write-Host "Group '$DisplayName' already exists with ID: $($existingGroup.id)" -ForegroundColor Yellow
+
+            # Get current members of the existing group
+            $currentMembers = @()
+            try {
+                $membersResult = Invoke-PnPGraphMethod -Url "groups/$($existingGroup.id)/members" -Method Get -ErrorAction SilentlyContinue
+                if ($membersResult -and $membersResult.value) {
+                    $currentMembers = $membersResult.value | ForEach-Object {
+                        if ($_.mail) { $_.mail.ToLower() }
+                        elseif ($_.userPrincipalName) { $_.userPrincipalName.ToLower() }
+                    } | Where-Object { $_ }
+                }
+            }
+            catch {
+                Write-Warning "Could not retrieve current group members: $_"
+            }
+
+            # Compare members if expected members provided
+            if ($ExpectedMembers -and $ExpectedMembers.Count -gt 0) {
+                $expectedLower = $ExpectedMembers | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.ToLower() }
+
+                $missingMembers = $expectedLower | Where-Object { $_ -notin $currentMembers }
+                $extraMembers = $currentMembers | Where-Object { $_ -notin $expectedLower }
+
+                if ($missingMembers -or $extraMembers) {
+                    Write-Warning "Group members differ from expected mailbox permissions!"
+                    if ($missingMembers) {
+                        Write-Host "  Missing from group: $($missingMembers -join ', ')" -ForegroundColor Red
+                    }
+                    if ($extraMembers) {
+                        Write-Host "  Extra in group: $($extraMembers -join ', ')" -ForegroundColor Red
+                    }
+                    return [PSCustomObject]@{
+                        Id            = $existingGroup.id
+                        DisplayName   = $existingGroup.displayName
+                        AlreadyExists = $true
+                        MembersMismatch = $true
+                        MissingMembers = $missingMembers
+                        ExtraMembers   = $extraMembers
+                    }
+                }
+            }
+
             return [PSCustomObject]@{
-                Id          = $existingGroup.id
-                DisplayName = $existingGroup.displayName
+                Id            = $existingGroup.id
+                DisplayName   = $existingGroup.displayName
+                AlreadyExists = $true
+                MembersMismatch = $false
             }
         }
 
@@ -312,16 +360,18 @@ function Get-OrCreateSecurityGroup {
 
         Write-Host "Created security group: $DisplayName (ID: $($newGroup.id))" -ForegroundColor Green
         return [PSCustomObject]@{
-            Id          = $newGroup.id
-            DisplayName = $newGroup.displayName
+            Id            = $newGroup.id
+            DisplayName   = $newGroup.displayName
+            AlreadyExists = $false
+            MembersMismatch = $false
         }
     }
     catch {
         Write-Error "Failed to create group '$DisplayName': $_"
         Write-Host ""
         Write-Host "If you see 'Insufficient privileges', your Azure AD app needs these API permissions:" -ForegroundColor Yellow
-        Write-Host "  - Group.ReadWrite.All (Application)" -ForegroundColor Cyan
-        Write-Host "  - User.Read.All (Application)" -ForegroundColor Cyan
+        Write-Host "  - Group.ReadWrite.All (Delegated)" -ForegroundColor Cyan
+        Write-Host "  - User.Read.All (Delegated)" -ForegroundColor Cyan
         Write-Host ""
         Write-Host "Add permissions in Azure Portal > App Registrations > Your App > API Permissions" -ForegroundColor Yellow
         Write-Host "Don't forget to click 'Grant admin consent' after adding permissions!" -ForegroundColor Yellow
@@ -406,25 +456,46 @@ function Set-GroupMailboxPermission {
     <#
     .SYNOPSIS
         Grants SendAs permission to a security group for a shared mailbox.
+        Includes retry logic for newly created groups that haven't synced to Exchange yet.
     #>
     param(
         [Parameter(Mandatory = $true)]
         [string]$MailboxIdentity,
 
         [Parameter(Mandatory = $true)]
-        [string]$GroupName
+        [string]$GroupName,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$IsNewGroup = $false
     )
 
-    try {
-        # Add SendAs permission using the group's display name
-        Add-RecipientPermission -Identity $MailboxIdentity -Trustee $GroupName -AccessRights SendAs -Confirm:$false
-        Write-Host "Granted SendAs permission to group for mailbox: $MailboxIdentity" -ForegroundColor Green
-        return $true
+    $maxRetries = 5
+    $retryDelaySeconds = 30
+
+    for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+        try {
+            # Add SendAs permission using the group's display name
+            Add-RecipientPermission -Identity $MailboxIdentity -Trustee $GroupName -AccessRights SendAs -Confirm:$false -ErrorAction Stop
+            Write-Host "Granted SendAs permission to group for mailbox: $MailboxIdentity" -ForegroundColor Green
+            return $true
+        }
+        catch {
+            $errorMessage = $_.Exception.Message
+
+            # Check if it's a "group not found" error and this is a new group
+            if ($errorMessage -like "*wasn't found*" -and $IsNewGroup -and $attempt -lt $maxRetries) {
+                Write-Host "Group not yet synced to Exchange. Waiting $retryDelaySeconds seconds... (Attempt $attempt of $maxRetries)" -ForegroundColor Yellow
+                Start-Sleep -Seconds $retryDelaySeconds
+                continue
+            }
+
+            Write-Warning "Failed to grant SendAs permission: $errorMessage"
+            return $false
+        }
     }
-    catch {
-        Write-Warning "Failed to grant SendAs permission: $_"
-        return $false
-    }
+
+    Write-Warning "Failed to grant SendAs permission after $maxRetries attempts. The group may need more time to sync to Exchange."
+    return $false
 }
 
 function Update-SharePointList {
@@ -511,27 +582,47 @@ function Import-AndProcessMailboxData {
 
         Write-Host "`n--- Processing: $($row.'Mailbox address') ---" -ForegroundColor Cyan
 
-        # Step 1: Create security group
+        # Parse members list
+        $members = @()
+        if ($row.Members) {
+            $members = $row.Members -split ";" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        }
+
+        # Step 1: Create or get security group (with member comparison)
         $description = "Security group for shared mailbox: $($row.'Mailbox address')"
-        $group = Get-OrCreateSecurityGroup -DisplayName $row.'M365 Group Name' -Description $description
+        $group = Get-OrCreateSecurityGroup -DisplayName $row.'M365 Group Name' -Description $description -ExpectedMembers $members
 
         if (-not $group) {
             Write-Warning "Skipping mailbox $($row.'Mailbox address') due to group creation failure"
+            $row.'Status' = "Error - Group creation failed"
             continue
         }
 
-        # Step 2: Add users to the group
-        if ($row.Members) {
-            $members = $row.Members -split ";"
-            $result = Add-UsersToSecurityGroup -GroupId $group.Id -UserEmails $members
-            Write-Host "Added $($result.Added) users, $($result.Failed) failed" -ForegroundColor Yellow
-        }
-        else {
-            Write-Host "No members to add for this mailbox" -ForegroundColor Yellow
+        # Check if group exists with mismatched members
+        if ($group.MembersMismatch) {
+            Write-Host "ERROR: Group exists with different members than mailbox permissions!" -ForegroundColor Red
+            $row.'M365 Group ID' = $group.Id
+            $row.'Status' = "Error - Group exists with different members"
+            continue
         }
 
-        # Step 3: Grant group permission to mailbox
-        $permissionGranted = Set-GroupMailboxPermission -MailboxIdentity $row.'Mailbox address' -GroupName $row.'M365 Group Name'
+        # Step 2: Add users to the group (only if newly created)
+        if (-not $group.AlreadyExists) {
+            if ($members.Count -gt 0) {
+                $result = Add-UsersToSecurityGroup -GroupId $group.Id -UserEmails $members
+                Write-Host "Added $($result.Added) users, $($result.Failed) failed" -ForegroundColor Yellow
+            }
+            else {
+                Write-Host "No members to add for this mailbox" -ForegroundColor Yellow
+            }
+        }
+        else {
+            Write-Host "Group already exists with matching members - skipping member sync" -ForegroundColor Yellow
+        }
+
+        # Step 3: Grant group permission to mailbox (with retry for new groups)
+        $isNewGroup = -not $group.AlreadyExists
+        $permissionGranted = Set-GroupMailboxPermission -MailboxIdentity $row.'Mailbox address' -GroupName $row.'M365 Group Name' -IsNewGroup $isNewGroup
 
         # Step 4: Update SharePoint list
         $spUpdated = Update-SharePointList -ListName $SharePointListName -SharedMailboxId $row.'MailboxID' -SecurityGroupId $group.Id
