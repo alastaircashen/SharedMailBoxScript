@@ -9,19 +9,27 @@
 
     Uses only ExchangeOnlineManagement and PnP.PowerShell modules.
 
+    PREREQUISITE: You must register an Azure AD application for PnP PowerShell.
+    Run this command once to register: Register-PnPEntraIDAppForInteractiveLogin -ApplicationName "PnP PowerShell" -Tenant yourtenant.onmicrosoft.com -Interactive
+    See: https://pnp.github.io/powershell/articles/registerapplication.html
+
 .PARAMETER Step
     Specify which step to run: 'Export', 'Import', or 'Both'
 
 .PARAMETER CsvPath
     Path to the CSV file (for export or import)
 
+.PARAMETER ClientId
+    The Azure AD Application (Client) ID for PnP PowerShell authentication.
+    Required for Import and Both steps.
+
 .PARAMETER SharePointSiteUrl
     SharePoint site URL for the list update
 
 .EXAMPLE
     .\SharedMailboxManager.ps1 -Step Export -CsvPath "C:\temp\SharedMailboxes.csv"
-    .\SharedMailboxManager.ps1 -Step Import -CsvPath "C:\temp\SharedMailboxes.csv"
-    .\SharedMailboxManager.ps1 -Step Both -CsvPath "C:\temp\SharedMailboxes.csv"
+    .\SharedMailboxManager.ps1 -Step Import -CsvPath "C:\temp\SharedMailboxes.csv" -ClientId "your-app-client-id"
+    .\SharedMailboxManager.ps1 -Step Both -CsvPath "C:\temp\SharedMailboxes.csv" -ClientId "your-app-client-id"
 #>
 
 [CmdletBinding()]
@@ -32,6 +40,9 @@ param(
 
     [Parameter(Mandatory = $true)]
     [string]$CsvPath,
+
+    [Parameter(Mandatory = $false)]
+    [string]$ClientId,
 
     [Parameter(Mandatory = $false)]
     [string]$SharePointSiteUrl = "https://zn8r8.sharepoint.com/sites/DMData",
@@ -93,7 +104,10 @@ function Connect-PnPService {
     #>
     param(
         [Parameter(Mandatory = $true)]
-        [string]$SiteUrl
+        [string]$SiteUrl,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ClientId
     )
 
     Write-Host "Connecting to PnP PowerShell..." -ForegroundColor Cyan
@@ -110,8 +124,8 @@ function Connect-PnPService {
         # Not connected, proceed with connection
     }
 
-    # Connect with interactive login - this handles both Graph and SharePoint
-    Connect-PnPOnline -Url $SiteUrl -Interactive
+    # Connect with interactive login using registered app
+    Connect-PnPOnline -Url $SiteUrl -ClientId $ClientId -Interactive
     Write-Host "Successfully connected to PnP PowerShell" -ForegroundColor Green
 }
 
@@ -516,6 +530,24 @@ try {
     Import-Module ExchangeOnlineManagement -ErrorAction Stop
     Import-Module PnP.PowerShell -ErrorAction Stop
 
+    # Validate ClientId is provided for Import/Both steps
+    if ($Step -in @('Import', 'Both') -and [string]::IsNullOrWhiteSpace($ClientId)) {
+        Write-Host ""
+        Write-Host "ERROR: ClientId is required for Import/Both steps." -ForegroundColor Red
+        Write-Host ""
+        Write-Host "You need to register an Azure AD application for PnP PowerShell:" -ForegroundColor Yellow
+        Write-Host "1. Run this command once:" -ForegroundColor White
+        Write-Host "   Register-PnPEntraIDAppForInteractiveLogin -ApplicationName 'PnP SharedMailbox Script' -Tenant yourtenant.onmicrosoft.com -Interactive" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "2. After registration, copy the Application (Client) ID" -ForegroundColor White
+        Write-Host ""
+        Write-Host "3. Run this script with the -ClientId parameter:" -ForegroundColor White
+        Write-Host "   .\SharedMailboxManager.ps1 -Step Import -CsvPath 'C:\temp\SharedMailboxes.csv' -ClientId 'your-client-id'" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "For more info: https://pnp.github.io/powershell/articles/registerapplication.html" -ForegroundColor Yellow
+        throw "ClientId parameter is required for Import/Both steps."
+    }
+
     switch ($Step) {
         'Export' {
             # Connect to Exchange Online only
@@ -530,7 +562,7 @@ try {
             Connect-ExchangeOnlineService
 
             # Connect to PnP for Graph and SharePoint operations
-            Connect-PnPService -SiteUrl $SharePointSiteUrl
+            Connect-PnPService -SiteUrl $SharePointSiteUrl -ClientId $ClientId
 
             # Import and process
             Import-AndProcessMailboxData -CsvPath $CsvPath -SharePointListName $SharePointListName
@@ -541,7 +573,7 @@ try {
             Connect-ExchangeOnlineService
 
             # Connect to PnP for Graph and SharePoint operations
-            Connect-PnPService -SiteUrl $SharePointSiteUrl
+            Connect-PnPService -SiteUrl $SharePointSiteUrl -ClientId $ClientId
 
             # Export first
             Export-SharedMailboxData -OutputPath $CsvPath
