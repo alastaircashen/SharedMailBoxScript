@@ -305,6 +305,11 @@ function Get-OrCreateSecurityGroup {
 
         $newGroup = Invoke-PnPGraphMethod -Url "groups" -Method Post -Content $groupBody
 
+        if (-not $newGroup -or -not $newGroup.id) {
+            Write-Error "Failed to create group '$DisplayName': No group ID returned"
+            return $null
+        }
+
         Write-Host "Created security group: $DisplayName (ID: $($newGroup.id))" -ForegroundColor Green
         return [PSCustomObject]@{
             Id          = $newGroup.id
@@ -313,6 +318,13 @@ function Get-OrCreateSecurityGroup {
     }
     catch {
         Write-Error "Failed to create group '$DisplayName': $_"
+        Write-Host ""
+        Write-Host "If you see 'Insufficient privileges', your Azure AD app needs these API permissions:" -ForegroundColor Yellow
+        Write-Host "  - Group.ReadWrite.All (Application)" -ForegroundColor Cyan
+        Write-Host "  - User.Read.All (Application)" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "Add permissions in Azure Portal > App Registrations > Your App > API Permissions" -ForegroundColor Yellow
+        Write-Host "Don't forget to click 'Grant admin consent' after adding permissions!" -ForegroundColor Yellow
         return $null
     }
 }
