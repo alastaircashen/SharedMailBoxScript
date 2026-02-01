@@ -42,7 +42,7 @@ param(
     [string]$CsvPath,
 
     [Parameter(Mandatory = $false)]
-    [string]$ClientId,
+    [string]$ClientId = "6042b520-90d0-4286-9192-fdbbe025740e",
 
     [Parameter(Mandatory = $false)]
     [string]$SharePointSiteUrl = "https://zn8r8.sharepoint.com/sites/DMData",
