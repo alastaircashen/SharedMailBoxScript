@@ -54,6 +54,9 @@ param(
 # Set execution policy to allow running unsigned scripts (current process only)
 Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
 
+# Load System.Web assembly for URL encoding
+Add-Type -AssemblyName System.Web
+
 #region Module Installation and Connection Functions
 
 function Install-RequiredModules {
@@ -260,7 +263,7 @@ function Export-SharedMailboxData {
 function Get-OrCreateSecurityGroup {
     <#
     .SYNOPSIS
-        Gets an existing security group or creates a new one using PnP PowerShell.
+        Gets an existing security group or creates a new one using PnP PowerShell Graph API.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -271,12 +274,17 @@ function Get-OrCreateSecurityGroup {
     )
 
     try {
-        # Check if group already exists
-        $existingGroup = Get-PnPAzureADGroup -Filter "displayName eq '$DisplayName'" -ErrorAction SilentlyContinue
+        # Check if group already exists using Graph API
+        $encodedFilter = [System.Web.HttpUtility]::UrlEncode("displayName eq '$DisplayName'")
+        $existingGroups = Invoke-PnPGraphMethod -Url "groups?`$filter=$encodedFilter" -Method Get -ErrorAction SilentlyContinue
 
-        if ($existingGroup) {
-            Write-Warning "Group '$DisplayName' already exists with ID: $($existingGroup.Id)"
-            return $existingGroup
+        if ($existingGroups -and $existingGroups.value -and $existingGroups.value.Count -gt 0) {
+            $existingGroup = $existingGroups.value[0]
+            Write-Warning "Group '$DisplayName' already exists with ID: $($existingGroup.id)"
+            return [PSCustomObject]@{
+                Id          = $existingGroup.id
+                DisplayName = $existingGroup.displayName
+            }
         }
 
         # Create mail nickname (alphanumeric only)
@@ -285,11 +293,23 @@ function Get-OrCreateSecurityGroup {
             $mailNickname = $mailNickname.Substring(0, 64)
         }
 
-        # Create new security group (mail-disabled)
-        $newGroup = New-PnPAzureADGroup -DisplayName $DisplayName -Description $Description -MailNickname $mailNickname -IsSecurityEnabled -MailEnabled:$false
+        # Create new security group (mail-disabled) using Graph API
+        $groupBody = @{
+            displayName     = $DisplayName
+            description     = $Description
+            mailEnabled     = $false
+            mailNickname    = $mailNickname
+            securityEnabled = $true
+            groupTypes      = @()
+        }
 
-        Write-Host "Created security group: $DisplayName (ID: $($newGroup.Id))" -ForegroundColor Green
-        return $newGroup
+        $newGroup = Invoke-PnPGraphMethod -Url "groups" -Method Post -Content $groupBody
+
+        Write-Host "Created security group: $DisplayName (ID: $($newGroup.id))" -ForegroundColor Green
+        return [PSCustomObject]@{
+            Id          = $newGroup.id
+            DisplayName = $newGroup.displayName
+        }
     }
     catch {
         Write-Error "Failed to create group '$DisplayName': $_"
@@ -300,7 +320,7 @@ function Get-OrCreateSecurityGroup {
 function Add-UsersToSecurityGroup {
     <#
     .SYNOPSIS
-        Adds users to a security group using PnP PowerShell.
+        Adds users to a security group using PnP PowerShell Graph API.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -313,11 +333,16 @@ function Add-UsersToSecurityGroup {
     $addedCount = 0
     $failedCount = 0
 
-    # Get existing members
-    $existingMembers = Get-PnPAzureADGroupMember -Identity $GroupId -ErrorAction SilentlyContinue
-    $existingMemberUpns = @()
-    if ($existingMembers) {
-        $existingMemberUpns = $existingMembers | ForEach-Object { $_.UserPrincipalName.ToLower() }
+    # Get existing members using Graph API
+    $existingMemberIds = @()
+    try {
+        $members = Invoke-PnPGraphMethod -Url "groups/$GroupId/members" -Method Get -ErrorAction SilentlyContinue
+        if ($members -and $members.value) {
+            $existingMemberIds = $members.value | ForEach-Object { $_.id }
+        }
+    }
+    catch {
+        # No existing members or error getting them
     }
 
     foreach ($email in $UserEmails) {
@@ -325,26 +350,31 @@ function Add-UsersToSecurityGroup {
             continue
         }
 
-        $emailLower = $email.ToLower()
-
         try {
-            # Check if user is already a member
-            if ($existingMemberUpns -contains $emailLower) {
-                Write-Host "User $email is already a member of the group" -ForegroundColor Yellow
-                continue
-            }
+            # Get user by email using Graph API
+            $encodedFilter = [System.Web.HttpUtility]::UrlEncode("mail eq '$email' or userPrincipalName eq '$email'")
+            $userResult = Invoke-PnPGraphMethod -Url "users?`$filter=$encodedFilter" -Method Get -ErrorAction SilentlyContinue
 
-            # Get user by email
-            $user = Get-PnPAzureADUser -Filter "mail eq '$email' or userPrincipalName eq '$email'" -ErrorAction SilentlyContinue | Select-Object -First 1
-
-            if (-not $user) {
+            if (-not $userResult -or -not $userResult.value -or $userResult.value.Count -eq 0) {
                 Write-Warning "User not found: $email"
                 $failedCount++
                 continue
             }
 
-            # Add user to group
-            Add-PnPAzureADGroupMember -Identity $GroupId -Users $user.UserPrincipalName
+            $user = $userResult.value[0]
+
+            # Check if user is already a member
+            if ($existingMemberIds -contains $user.id) {
+                Write-Host "User $email is already a member of the group" -ForegroundColor Yellow
+                continue
+            }
+
+            # Add user to group using Graph API
+            $memberBody = @{
+                "@odata.id" = "https://graph.microsoft.com/v1.0/directoryObjects/$($user.id)"
+            }
+            Invoke-PnPGraphMethod -Url "groups/$GroupId/members/`$ref" -Method Post -Content $memberBody
+
             Write-Host "Added $email to group" -ForegroundColor Green
             $addedCount++
         }
