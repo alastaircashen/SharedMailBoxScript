@@ -238,12 +238,14 @@ function Export-SharedMailboxData {
         }
 
         $exportData += [PSCustomObject]@{
-            'Mailbox address'  = $mailbox.PrimarySmtpAddress
-            'Members'          = $membersString
-            'MailboxID'        = $mailbox.ExchangeGuid.ToString()
-            'M365 Group Name'  = $groupName
-            'M365 Group ID'    = ""
-            'Status'           = "Ready to create"
+            'Mailbox address'       = $mailbox.PrimarySmtpAddress
+            'Members'               = $membersString
+            'MailboxID'             = $mailbox.ExchangeGuid.ToString()
+            'SharedMailboxObjectID' = $mailbox.ExternalDirectoryObjectId
+            'M365 Group Name'       = $groupName
+            'M365 Group ID'         = ""
+            'ExistingMapping'       = ""
+            'Status'                = "Ready to create"
         }
     }
 
@@ -498,42 +500,68 @@ function Set-GroupMailboxPermission {
     return $false
 }
 
+function Get-ExistingSharePointMappings {
+    <#
+    .SYNOPSIS
+        Gets all existing mappings from the SharePoint list.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ListName
+    )
+
+    try {
+        $allItems = Get-PnPListItem -List $ListName -PageSize 500 -ErrorAction SilentlyContinue
+        $mappings = @{}
+
+        if ($allItems) {
+            foreach ($item in $allItems) {
+                $sharedMailboxId = $item.FieldValues["SharedMailbox"]
+                if ($sharedMailboxId) {
+                    if (-not $mappings.ContainsKey($sharedMailboxId)) {
+                        $mappings[$sharedMailboxId] = @()
+                    }
+                    $mappings[$sharedMailboxId] += [PSCustomObject]@{
+                        ItemId         = $item.Id
+                        SharedMailbox  = $sharedMailboxId
+                        SecurityGroup  = $item.FieldValues["SecurityGroup"]
+                    }
+                }
+            }
+        }
+
+        return $mappings
+    }
+    catch {
+        Write-Warning "Failed to get existing SharePoint mappings: $_"
+        return @{}
+    }
+}
+
 function Update-SharePointList {
     <#
     .SYNOPSIS
-        Adds or updates an item in the SharePoint list using PnP PowerShell.
+        Adds an item to the SharePoint list using PnP PowerShell.
+        Always creates a new item - duplicates will be manually resolved.
     #>
     param(
         [Parameter(Mandatory = $true)]
         [string]$ListName,
 
         [Parameter(Mandatory = $true)]
-        [string]$SharedMailboxId,
+        [string]$SharedMailboxObjectId,
 
         [Parameter(Mandatory = $true)]
         [string]$SecurityGroupId
     )
 
     try {
-        # Check if item already exists
-        $existingItems = Get-PnPListItem -List $ListName -Query "<View><Query><Where><Eq><FieldRef Name='SharedMailbox'/><Value Type='Text'>$SharedMailboxId</Value></Eq></Where></Query></View>" -ErrorAction SilentlyContinue
-
-        if ($existingItems -and $existingItems.Count -gt 0) {
-            # Update existing item
-            $existingItem = $existingItems | Select-Object -First 1
-            Set-PnPListItem -List $ListName -Identity $existingItem.Id -Values @{
-                "SecurityGroup" = $SecurityGroupId
-            } | Out-Null
-            Write-Host "Updated SharePoint list item for mailbox: $SharedMailboxId" -ForegroundColor Green
-        }
-        else {
-            # Create new item
-            Add-PnPListItem -List $ListName -Values @{
-                "SharedMailbox"  = $SharedMailboxId
-                "SecurityGroup"  = $SecurityGroupId
-            } | Out-Null
-            Write-Host "Created SharePoint list item for mailbox: $SharedMailboxId" -ForegroundColor Green
-        }
+        # Always create new item - duplicates will be manually resolved
+        Add-PnPListItem -List $ListName -Values @{
+            "SharedMailbox"  = $SharedMailboxObjectId
+            "SecurityGroup"  = $SecurityGroupId
+        } | Out-Null
+        Write-Host "Created SharePoint list item for mailbox: $SharedMailboxObjectId" -ForegroundColor Green
 
         return $true
     }
@@ -564,6 +592,11 @@ function Import-AndProcessMailboxData {
     Write-Host "Importing CSV data from: $CsvPath" -ForegroundColor Cyan
     $mailboxData = Import-Csv -Path $CsvPath
 
+    # Get existing SharePoint mappings to check for duplicates
+    Write-Host "Checking for existing SharePoint mappings..." -ForegroundColor Cyan
+    $existingMappings = Get-ExistingSharePointMappings -ListName $SharePointListName
+    Write-Host "Found $($existingMappings.Count) unique mailbox mappings in SharePoint" -ForegroundColor Yellow
+
     # Filter for rows ready to create
     $rowsToProcess = $mailboxData | Where-Object { $_.'Status' -eq "Ready to create" }
 
@@ -581,6 +614,17 @@ function Import-AndProcessMailboxData {
         Write-Progress -Activity "Processing Mailboxes" -Status "$counter of $($rowsToProcess.Count) - $($row.'Mailbox address')" -PercentComplete $percentComplete
 
         Write-Host "`n--- Processing: $($row.'Mailbox address') ---" -ForegroundColor Cyan
+
+        # Check for existing SharePoint mapping
+        $mailboxObjectId = $row.'SharedMailboxObjectID'
+        if ($existingMappings.ContainsKey($mailboxObjectId)) {
+            $existingCount = $existingMappings[$mailboxObjectId].Count
+            $row.'ExistingMapping' = "Yes - $existingCount existing mapping(s)"
+            Write-Host "WARNING: Found $existingCount existing mapping(s) in SharePoint for this mailbox" -ForegroundColor Yellow
+        }
+        else {
+            $row.'ExistingMapping' = "No"
+        }
 
         # Parse members list
         $members = @()
@@ -624,8 +668,8 @@ function Import-AndProcessMailboxData {
         $isNewGroup = -not $group.AlreadyExists
         $permissionGranted = Set-GroupMailboxPermission -MailboxIdentity $row.'Mailbox address' -GroupName $row.'M365 Group Name' -IsNewGroup $isNewGroup
 
-        # Step 4: Update SharePoint list
-        $spUpdated = Update-SharePointList -ListName $SharePointListName -SharedMailboxId $row.'MailboxID' -SecurityGroupId $group.Id
+        # Step 4: Update SharePoint list with SharedMailboxObjectID
+        $spUpdated = Update-SharePointList -ListName $SharePointListName -SharedMailboxObjectId $mailboxObjectId -SecurityGroupId $group.Id
 
         # Step 5: Update the CSV row
         $row.'M365 Group ID' = $group.Id
