@@ -48,7 +48,10 @@ param(
     [string]$SharePointSiteUrl = "https://zn8r8.sharepoint.com/sites/DMData",
 
     [Parameter(Mandatory = $false)]
-    [string]$SharePointListName = "Shared Mailboxes Mapping"
+    [string]$SharePointListName = "Shared Mailboxes Mapping",
+
+    [Parameter(Mandatory = $false)]
+    [switch]$TestMode
 )
 
 # Set execution policy to allow running unsigned scripts (current process only)
@@ -587,12 +590,21 @@ function Import-AndProcessMailboxData {
         [string]$CsvPath,
 
         [Parameter(Mandatory = $true)]
-        [string]$SharePointListName
+        [string]$SharePointListName,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$TestMode = $false
     )
 
     if (-not (Test-Path $CsvPath)) {
         Write-Error "CSV file not found: $CsvPath"
         return
+    }
+
+    if ($TestMode) {
+        Write-Host ""
+        Write-Host "*** TEST MODE ENABLED - Only processing first 5 mailboxes ***" -ForegroundColor Magenta
+        Write-Host ""
     }
 
     Write-Host "Importing CSV data from: $CsvPath" -ForegroundColor Cyan
@@ -611,7 +623,14 @@ function Import-AndProcessMailboxData {
         return
     }
 
-    Write-Host "Found $($rowsToProcess.Count) mailboxes to process." -ForegroundColor Green
+    # Limit to first 5 in test mode
+    $totalCount = @($rowsToProcess).Count
+    if ($TestMode -and $totalCount -gt 5) {
+        $rowsToProcess = $rowsToProcess | Select-Object -First 5
+        Write-Host "TEST MODE: Limited to first 5 of $totalCount mailboxes" -ForegroundColor Magenta
+    }
+
+    Write-Host "Found $(@($rowsToProcess).Count) mailboxes to process." -ForegroundColor Green
 
     $counter = 0
     foreach ($row in $rowsToProcess) {
@@ -650,22 +669,32 @@ function Import-AndProcessMailboxData {
 
         # Step 2: Handle group members
         if ($group.AlreadyExists) {
-            if ($group.MembersMismatch) {
-                Write-Host "Note: Group already exists with different members (this is OK if group was previously added to mailbox)" -ForegroundColor Yellow
-                if ($group.MissingMembers) {
-                    Write-Host "  Members in mailbox but not in group: $($group.MissingMembers -join ', ')" -ForegroundColor Yellow
+            Write-Host "Group already exists" -ForegroundColor Yellow
+            if ($group.MembersMismatch -and $group.MissingMembers) {
+                # Filter out any GUIDs from missing members (these are likely the group itself added to the mailbox)
+                $membersToAdd = $group.MissingMembers | Where-Object {
+                    $_ -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
                 }
+
+                if ($membersToAdd -and $membersToAdd.Count -gt 0) {
+                    Write-Host "Syncing missing members to group: $($membersToAdd -join ', ')" -ForegroundColor Cyan
+                    $result = Add-UsersToSecurityGroup -GroupId $group.Id -UserEmails $membersToAdd
+                    Write-Host "Added $($result.Added) users, $($result.Failed) failed" -ForegroundColor Yellow
+                }
+                else {
+                    Write-Host "No user members to sync (only GUIDs found in difference - likely group reference)" -ForegroundColor Yellow
+                }
+
                 if ($group.ExtraMembers) {
-                    Write-Host "  Members in group but not in mailbox: $($group.ExtraMembers -join ', ')" -ForegroundColor Yellow
+                    Write-Host "Note: Extra members in group (not in mailbox permissions): $($group.ExtraMembers -join ', ')" -ForegroundColor Yellow
                 }
             }
             else {
-                Write-Host "Group already exists with matching members" -ForegroundColor Yellow
+                Write-Host "Group members are in sync" -ForegroundColor Green
             }
-            Write-Host "Skipping member sync - group already configured" -ForegroundColor Yellow
         }
         else {
-            # Only add members for newly created groups
+            # Add all members for newly created groups
             if ($members.Count -gt 0) {
                 $result = Add-UsersToSecurityGroup -GroupId $group.Id -UserEmails $members
                 Write-Host "Added $($result.Added) users, $($result.Failed) failed" -ForegroundColor Yellow
@@ -753,7 +782,7 @@ try {
             Connect-PnPService -SiteUrl $SharePointSiteUrl -ClientId $ClientId
 
             # Import and process
-            Import-AndProcessMailboxData -CsvPath $CsvPath -SharePointListName $SharePointListName
+            Import-AndProcessMailboxData -CsvPath $CsvPath -SharePointListName $SharePointListName -TestMode $TestMode.IsPresent
         }
 
         'Both' {
@@ -767,7 +796,7 @@ try {
             Export-SharedMailboxData -OutputPath $CsvPath
 
             # Then import and process
-            Import-AndProcessMailboxData -CsvPath $CsvPath -SharePointListName $SharePointListName
+            Import-AndProcessMailboxData -CsvPath $CsvPath -SharePointListName $SharePointListName -TestMode $TestMode.IsPresent
         }
     }
 
