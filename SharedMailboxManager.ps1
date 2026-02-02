@@ -484,6 +484,12 @@ function Set-GroupMailboxPermission {
         catch {
             $errorMessage = $_.Exception.Message
 
+            # Check if permission already exists
+            if ($errorMessage -like "*already has*" -or $errorMessage -like "*already been granted*" -or $errorMessage -like "*duplicate*") {
+                Write-Host "SendAs permission already exists for group on mailbox: $MailboxIdentity - skipping" -ForegroundColor Yellow
+                return $true
+            }
+
             # Check if it's a "group not found" error and this is a new group
             if ($errorMessage -like "*wasn't found*" -and $IsNewGroup -and $attempt -lt $maxRetries) {
                 Write-Host "Group not yet synced to Exchange. Waiting $retryDelaySeconds seconds... (Attempt $attempt of $maxRetries)" -ForegroundColor Yellow
@@ -642,16 +648,24 @@ function Import-AndProcessMailboxData {
             continue
         }
 
-        # Check if group exists with mismatched members
-        if ($group.MembersMismatch) {
-            Write-Host "ERROR: Group exists with different members than mailbox permissions!" -ForegroundColor Red
-            $row.'M365 Group ID' = $group.Id
-            $row.'Status' = "Error - Group exists with different members"
-            continue
+        # Step 2: Handle group members
+        if ($group.AlreadyExists) {
+            if ($group.MembersMismatch) {
+                Write-Host "Note: Group already exists with different members (this is OK if group was previously added to mailbox)" -ForegroundColor Yellow
+                if ($group.MissingMembers) {
+                    Write-Host "  Members in mailbox but not in group: $($group.MissingMembers -join ', ')" -ForegroundColor Yellow
+                }
+                if ($group.ExtraMembers) {
+                    Write-Host "  Members in group but not in mailbox: $($group.ExtraMembers -join ', ')" -ForegroundColor Yellow
+                }
+            }
+            else {
+                Write-Host "Group already exists with matching members" -ForegroundColor Yellow
+            }
+            Write-Host "Skipping member sync - group already configured" -ForegroundColor Yellow
         }
-
-        # Step 2: Add users to the group (only if newly created)
-        if (-not $group.AlreadyExists) {
+        else {
+            # Only add members for newly created groups
             if ($members.Count -gt 0) {
                 $result = Add-UsersToSecurityGroup -GroupId $group.Id -UserEmails $members
                 Write-Host "Added $($result.Added) users, $($result.Failed) failed" -ForegroundColor Yellow
@@ -659,9 +673,6 @@ function Import-AndProcessMailboxData {
             else {
                 Write-Host "No members to add for this mailbox" -ForegroundColor Yellow
             }
-        }
-        else {
-            Write-Host "Group already exists with matching members - skipping member sync" -ForegroundColor Yellow
         }
 
         # Step 3: Grant group permission to mailbox (with retry for new groups)
