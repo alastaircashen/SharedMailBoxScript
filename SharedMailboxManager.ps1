@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Manages M365 Shared Mailboxes - Exports mailbox data and creates security groups for permissions.
+    Manages M365 Shared Mailboxes - Exports mailbox data and syncs security groups with matching membership.
 
 .DESCRIPTION
     This script provides two main functions:
@@ -635,7 +635,7 @@ function Import-AndProcessMailboxData {
         if ($group.AlreadyExists) {
             Write-Host "Group already exists" -ForegroundColor Yellow
             if ($group.MembersMismatch -and $group.MissingMembers) {
-                # Filter out any GUIDs from missing members (these are likely the group itself added to the mailbox)
+                # Filter out any GUIDs from missing members (these are service principals or groups, not user emails)
                 $membersToAdd = $group.MissingMembers | Where-Object {
                     $_ -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
                 }
@@ -646,7 +646,7 @@ function Import-AndProcessMailboxData {
                     Write-Host "Added $($result.Added) users, $($result.Failed) failed" -ForegroundColor Yellow
                 }
                 else {
-                    Write-Host "No user members to sync (only GUIDs found in difference - likely group reference)" -ForegroundColor Yellow
+                    Write-Host "No user members to sync (only non-user entities found in difference)" -ForegroundColor Yellow
                 }
 
                 if ($group.ExtraMembers) {
