@@ -5,7 +5,10 @@
 .DESCRIPTION
     This script provides two main functions:
     Step 1: Export all shared mailboxes and their send permissions to a CSV file
-    Step 2: Import the CSV, create security groups, assign permissions, and update SharePoint
+    Step 2: Import the CSV, create security groups with matching membership, and update SharePoint
+
+    The script ensures each shared mailbox has a corresponding security group with identical
+    membership. It can be run at any time to sync group membership with mailbox permissions.
 
     Uses only ExchangeOnlineManagement and PnP.PowerShell modules.
 
@@ -457,91 +460,6 @@ function Add-UsersToSecurityGroup {
     }
 }
 
-function Set-GroupMailboxPermission {
-    <#
-    .SYNOPSIS
-        Grants SendAs and FullAccess permissions to a security group for a shared mailbox.
-        Includes retry logic for newly created groups that haven't synced to Exchange yet.
-    #>
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$MailboxIdentity,
-
-        [Parameter(Mandatory = $true)]
-        [string]$GroupName,
-
-        [Parameter(Mandatory = $false)]
-        [bool]$IsNewGroup = $false
-    )
-
-    $maxRetries = 5
-    $retryDelaySeconds = 30
-    $sendAsGranted = $false
-    $fullAccessGranted = $false
-
-    # Grant SendAs permission
-    for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
-        try {
-            Add-RecipientPermission -Identity $MailboxIdentity -Trustee $GroupName -AccessRights SendAs -Confirm:$false -ErrorAction Stop
-            Write-Host "Granted SendAs permission to group for mailbox: $MailboxIdentity" -ForegroundColor Green
-            $sendAsGranted = $true
-            break
-        }
-        catch {
-            $errorMessage = $_.Exception.Message
-
-            # Check if permission already exists
-            if ($errorMessage -like "*already has*" -or $errorMessage -like "*already been granted*" -or $errorMessage -like "*duplicate*") {
-                Write-Host "SendAs permission already exists for group on mailbox: $MailboxIdentity - skipping" -ForegroundColor Yellow
-                $sendAsGranted = $true
-                break
-            }
-
-            # Check if it's a "group not found" error and this is a new group
-            if ($errorMessage -like "*wasn't found*" -and $IsNewGroup -and $attempt -lt $maxRetries) {
-                Write-Host "Group not yet synced to Exchange. Waiting $retryDelaySeconds seconds... (Attempt $attempt of $maxRetries)" -ForegroundColor Yellow
-                Start-Sleep -Seconds $retryDelaySeconds
-                continue
-            }
-
-            Write-Warning "Failed to grant SendAs permission: $errorMessage"
-            break
-        }
-    }
-
-    # Grant FullAccess permission
-    for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
-        try {
-            Add-MailboxPermission -Identity $MailboxIdentity -User $GroupName -AccessRights FullAccess -AutoMapping $false -Confirm:$false -ErrorAction Stop
-            Write-Host "Granted FullAccess permission to group for mailbox: $MailboxIdentity" -ForegroundColor Green
-            $fullAccessGranted = $true
-            break
-        }
-        catch {
-            $errorMessage = $_.Exception.Message
-
-            # Check if permission already exists
-            if ($errorMessage -like "*already has*" -or $errorMessage -like "*already been granted*" -or $errorMessage -like "*duplicate*" -or $errorMessage -like "*already exists*") {
-                Write-Host "FullAccess permission already exists for group on mailbox: $MailboxIdentity - skipping" -ForegroundColor Yellow
-                $fullAccessGranted = $true
-                break
-            }
-
-            # Check if it's a "group not found" error and this is a new group
-            if ($errorMessage -like "*wasn't found*" -and $IsNewGroup -and $attempt -lt $maxRetries) {
-                Write-Host "Group not yet synced to Exchange for FullAccess. Waiting $retryDelaySeconds seconds... (Attempt $attempt of $maxRetries)" -ForegroundColor Yellow
-                Start-Sleep -Seconds $retryDelaySeconds
-                continue
-            }
-
-            Write-Warning "Failed to grant FullAccess permission: $errorMessage"
-            break
-        }
-    }
-
-    return ($sendAsGranted -and $fullAccessGranted)
-}
-
 function Get-ExistingSharePointMappings {
     <#
     .SYNOPSIS
@@ -583,8 +501,7 @@ function Get-ExistingSharePointMappings {
 function Update-SharePointList {
     <#
     .SYNOPSIS
-        Adds an item to the SharePoint list using PnP PowerShell.
-        Always creates a new item - duplicates will be manually resolved.
+        Adds an item to the SharePoint list if the mailbox-group mapping doesn't already exist.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -594,11 +511,24 @@ function Update-SharePointList {
         [string]$SharedMailboxObjectId,
 
         [Parameter(Mandatory = $true)]
-        [string]$SecurityGroupId
+        [string]$SecurityGroupId,
+
+        [Parameter(Mandatory = $false)]
+        [hashtable]$ExistingMappings = @{}
     )
 
     try {
-        # Always create new item - duplicates will be manually resolved
+        # Check if this exact mailbox-group mapping already exists
+        if ($ExistingMappings.ContainsKey($SharedMailboxObjectId)) {
+            $existingItems = $ExistingMappings[$SharedMailboxObjectId]
+            $matchingItem = $existingItems | Where-Object { $_.SecurityGroup -eq $SecurityGroupId }
+            if ($matchingItem) {
+                Write-Host "SharePoint mapping already exists for this mailbox-group combination - skipping" -ForegroundColor Yellow
+                return $true
+            }
+        }
+
+        # Create new item since mapping doesn't exist
         Add-PnPListItem -List $ListName -Values @{
             "SharedMailbox"  = $SharedMailboxObjectId
             "SecurityGroup"  = $SecurityGroupId
@@ -616,7 +546,8 @@ function Update-SharePointList {
 function Import-AndProcessMailboxData {
     <#
     .SYNOPSIS
-        Imports CSV data and creates security groups for shared mailboxes.
+        Imports CSV data and creates/syncs security groups for shared mailboxes.
+        Ensures group membership matches mailbox permissions. Can be run repeatedly.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -648,11 +579,11 @@ function Import-AndProcessMailboxData {
     $existingMappings = Get-ExistingSharePointMappings -ListName $SharePointListName
     Write-Host "Found $($existingMappings.Count) unique mailbox mappings in SharePoint" -ForegroundColor Yellow
 
-    # Filter for rows ready to create
-    $rowsToProcess = $mailboxData | Where-Object { $_.'Status' -eq "Ready to create" }
+    # Filter for rows to process (skip only error rows)
+    $rowsToProcess = $mailboxData | Where-Object { $_.'Status' -notlike "Error*" }
 
     if (-not $rowsToProcess) {
-        Write-Warning "No rows with 'Ready to create' status found."
+        Write-Warning "No rows to process found."
         return
     }
 
@@ -660,18 +591,18 @@ function Import-AndProcessMailboxData {
     $totalCount = @($rowsToProcess).Count
     if ($TestMode -and $totalCount -gt 5) {
         $rowsToProcess = $rowsToProcess | Select-Object -First 5
-        Write-Host "TEST MODE: Limited to first 5 of $totalCount mailboxes" -ForegroundColor Magenta
+        Write-Host "TEST MODE: Syncing first 5 of $totalCount mailboxes" -ForegroundColor Magenta
     }
 
-    Write-Host "Found $(@($rowsToProcess).Count) mailboxes to process." -ForegroundColor Green
+    Write-Host "Found $(@($rowsToProcess).Count) mailboxes to sync." -ForegroundColor Green
 
     $counter = 0
     foreach ($row in $rowsToProcess) {
         $counter++
         $percentComplete = [math]::Round(($counter / $rowsToProcess.Count) * 100, 2)
-        Write-Progress -Activity "Processing Mailboxes" -Status "$counter of $($rowsToProcess.Count) - $($row.'Mailbox address')" -PercentComplete $percentComplete
+        Write-Progress -Activity "Syncing Mailbox Groups" -Status "$counter of $($rowsToProcess.Count) - $($row.'Mailbox address')" -PercentComplete $percentComplete
 
-        Write-Host "`n--- Processing: $($row.'Mailbox address') ---" -ForegroundColor Cyan
+        Write-Host "`n--- Syncing: $($row.'Mailbox address') ---" -ForegroundColor Cyan
 
         # Check for existing SharePoint mapping
         $mailboxObjectId = $row.'SharedMailboxObjectID'
@@ -690,7 +621,7 @@ function Import-AndProcessMailboxData {
             $members = $row.Members -split ";" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
         }
 
-        # Step 1: Create or get security group (with member comparison)
+        # Step 1: Get or create security group (with member comparison)
         $description = "Security group for shared mailbox: $($row.'Mailbox address')"
         $group = Get-OrCreateSecurityGroup -DisplayName $row.'M365 Group Name' -Description $description -ExpectedMembers $members
 
@@ -700,7 +631,7 @@ function Import-AndProcessMailboxData {
             continue
         }
 
-        # Step 2: Handle group members
+        # Step 2: Sync group members to match mailbox permissions
         if ($group.AlreadyExists) {
             Write-Host "Group already exists" -ForegroundColor Yellow
             if ($group.MembersMismatch -and $group.MissingMembers) {
@@ -737,24 +668,20 @@ function Import-AndProcessMailboxData {
             }
         }
 
-        # Step 3: Grant group permission to mailbox (with retry for new groups)
-        $isNewGroup = -not $group.AlreadyExists
-        $permissionGranted = Set-GroupMailboxPermission -MailboxIdentity $row.'Mailbox address' -GroupName $row.'M365 Group Name' -IsNewGroup $isNewGroup
+        # Step 3: Update SharePoint list with SharedMailboxObjectID (only if mapping doesn't exist)
+        $spUpdated = Update-SharePointList -ListName $SharePointListName -SharedMailboxObjectId $mailboxObjectId -SecurityGroupId $group.Id -ExistingMappings $existingMappings
 
-        # Step 4: Update SharePoint list with SharedMailboxObjectID
-        $spUpdated = Update-SharePointList -ListName $SharePointListName -SharedMailboxObjectId $mailboxObjectId -SecurityGroupId $group.Id
-
-        # Step 5: Update the CSV row
+        # Step 4: Update the CSV row
         $row.'M365 Group ID' = $group.Id
-        if ($permissionGranted -and $spUpdated) {
-            $row.'Status' = "Created"
+        if ($spUpdated) {
+            $row.'Status' = "Synced"
         }
         else {
-            $row.'Status' = "Partial - Check logs"
+            $row.'Status' = "Synced - SharePoint update failed"
         }
     }
 
-    Write-Progress -Activity "Processing Mailboxes" -Completed
+    Write-Progress -Activity "Syncing Mailbox Groups" -Completed
 
     # Save updated CSV
     $mailboxData | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
@@ -768,7 +695,7 @@ function Import-AndProcessMailboxData {
 # Main script execution
 try {
     Write-Host "==================================================" -ForegroundColor Cyan
-    Write-Host "   M365 Shared Mailbox Security Group Manager     " -ForegroundColor Cyan
+    Write-Host "  M365 Shared Mailbox Security Group Sync Tool    " -ForegroundColor Cyan
     Write-Host "==================================================" -ForegroundColor Cyan
     Write-Host ""
 
