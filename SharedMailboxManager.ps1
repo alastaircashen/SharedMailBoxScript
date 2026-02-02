@@ -460,7 +460,7 @@ function Add-UsersToSecurityGroup {
 function Set-GroupMailboxPermission {
     <#
     .SYNOPSIS
-        Grants SendAs permission to a security group for a shared mailbox.
+        Grants SendAs and FullAccess permissions to a security group for a shared mailbox.
         Includes retry logic for newly created groups that haven't synced to Exchange yet.
     #>
     param(
@@ -476,13 +476,16 @@ function Set-GroupMailboxPermission {
 
     $maxRetries = 5
     $retryDelaySeconds = 30
+    $sendAsGranted = $false
+    $fullAccessGranted = $false
 
+    # Grant SendAs permission
     for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
         try {
-            # Add SendAs permission using the group's display name
             Add-RecipientPermission -Identity $MailboxIdentity -Trustee $GroupName -AccessRights SendAs -Confirm:$false -ErrorAction Stop
             Write-Host "Granted SendAs permission to group for mailbox: $MailboxIdentity" -ForegroundColor Green
-            return $true
+            $sendAsGranted = $true
+            break
         }
         catch {
             $errorMessage = $_.Exception.Message
@@ -490,7 +493,8 @@ function Set-GroupMailboxPermission {
             # Check if permission already exists
             if ($errorMessage -like "*already has*" -or $errorMessage -like "*already been granted*" -or $errorMessage -like "*duplicate*") {
                 Write-Host "SendAs permission already exists for group on mailbox: $MailboxIdentity - skipping" -ForegroundColor Yellow
-                return $true
+                $sendAsGranted = $true
+                break
             }
 
             # Check if it's a "group not found" error and this is a new group
@@ -501,12 +505,41 @@ function Set-GroupMailboxPermission {
             }
 
             Write-Warning "Failed to grant SendAs permission: $errorMessage"
-            return $false
+            break
         }
     }
 
-    Write-Warning "Failed to grant SendAs permission after $maxRetries attempts. The group may need more time to sync to Exchange."
-    return $false
+    # Grant FullAccess permission
+    for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+        try {
+            Add-MailboxPermission -Identity $MailboxIdentity -User $GroupName -AccessRights FullAccess -AutoMapping $false -Confirm:$false -ErrorAction Stop
+            Write-Host "Granted FullAccess permission to group for mailbox: $MailboxIdentity" -ForegroundColor Green
+            $fullAccessGranted = $true
+            break
+        }
+        catch {
+            $errorMessage = $_.Exception.Message
+
+            # Check if permission already exists
+            if ($errorMessage -like "*already has*" -or $errorMessage -like "*already been granted*" -or $errorMessage -like "*duplicate*" -or $errorMessage -like "*already exists*") {
+                Write-Host "FullAccess permission already exists for group on mailbox: $MailboxIdentity - skipping" -ForegroundColor Yellow
+                $fullAccessGranted = $true
+                break
+            }
+
+            # Check if it's a "group not found" error and this is a new group
+            if ($errorMessage -like "*wasn't found*" -and $IsNewGroup -and $attempt -lt $maxRetries) {
+                Write-Host "Group not yet synced to Exchange for FullAccess. Waiting $retryDelaySeconds seconds... (Attempt $attempt of $maxRetries)" -ForegroundColor Yellow
+                Start-Sleep -Seconds $retryDelaySeconds
+                continue
+            }
+
+            Write-Warning "Failed to grant FullAccess permission: $errorMessage"
+            break
+        }
+    }
+
+    return ($sendAsGranted -and $fullAccessGranted)
 }
 
 function Get-ExistingSharePointMappings {
