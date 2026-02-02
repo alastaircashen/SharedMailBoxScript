@@ -12,9 +12,25 @@
 
     Uses only ExchangeOnlineManagement and PnP.PowerShell modules.
 
-    PREREQUISITE: You must register an Azure AD application for PnP PowerShell.
-    Run this command once to register: Register-PnPEntraIDAppForInteractiveLogin -ApplicationName "PnP PowerShell" -Tenant yourtenant.onmicrosoft.com -Interactive
-    See: https://pnp.github.io/powershell/articles/registerapplication.html
+    PREREQUISITES:
+
+    1. SHAREPOINT LIST
+       The SharePoint list "Shared Mailboxes Mapping" should already exist in your environment.
+       Update the -SharePointSiteUrl parameter to point to your SharePoint site.
+       List requires two text columns: SharedMailbox, SecurityGroup
+
+    2. PNP APP REGISTRATION
+       First, check if you have an existing PnP PowerShell app registration:
+       - Go to Azure Portal > App Registrations > Search for "PnP"
+       - Verify it has these DELEGATED permissions (not Application):
+         * Microsoft Graph: Group.ReadWrite.All, User.Read.All
+         * SharePoint: AllSites.FullControl
+       - Ensure admin consent has been granted
+
+       If no existing registration, create one:
+       Register-PnPEntraIDAppForInteractiveLogin -ApplicationName "PnP PowerShell" -Tenant yourtenant.onmicrosoft.com -Interactive
+
+       See: https://pnp.github.io/powershell/articles/registerapplication.html
 
 .PARAMETER Step
     Specify which step to run: 'Export', 'Import', or 'Both'
@@ -27,12 +43,31 @@
     Required for Import and Both steps.
 
 .PARAMETER SharePointSiteUrl
-    SharePoint site URL for the list update
+    SharePoint site URL containing the Shared Mailboxes Mapping list.
+    Update this to your client's SharePoint site URL.
+
+.PARAMETER SharePointListName
+    Name of the SharePoint list for storing mailbox-to-group mappings.
+    Default: "Shared Mailboxes Mapping"
+
+.PARAMETER TestMode
+    When specified, only processes the first 5 mailboxes. Useful for testing.
 
 .EXAMPLE
+    # Export shared mailboxes to CSV
     .\SharedMailboxManager.ps1 -Step Export -CsvPath "C:\temp\SharedMailboxes.csv"
-    .\SharedMailboxManager.ps1 -Step Import -CsvPath "C:\temp\SharedMailboxes.csv" -ClientId "your-app-client-id"
-    .\SharedMailboxManager.ps1 -Step Both -CsvPath "C:\temp\SharedMailboxes.csv" -ClientId "your-app-client-id"
+
+.EXAMPLE
+    # Import and process mailboxes (test mode - first 5 only)
+    .\SharedMailboxManager.ps1 -Step Import -CsvPath "C:\temp\SharedMailboxes.csv" -TestMode
+
+.EXAMPLE
+    # Import and process all mailboxes
+    .\SharedMailboxManager.ps1 -Step Import -CsvPath "C:\temp\SharedMailboxes.csv"
+
+.EXAMPLE
+    # Export and import in one run
+    .\SharedMailboxManager.ps1 -Step Both -CsvPath "C:\temp\SharedMailboxes.csv"
 #>
 
 [CmdletBinding()]
