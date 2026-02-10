@@ -53,6 +53,11 @@
 .PARAMETER TestMode
     When specified, only processes the first 5 mailboxes. Useful for testing.
 
+.PARAMETER ExclusionListPath
+    Path to a CSV file containing shared mailbox addresses to exclude from processing.
+    The CSV should have a single column with mailbox email addresses. A header row is expected
+    (the column can have any name). Excluded mailboxes will be skipped during both export and import.
+
 .EXAMPLE
     # Export shared mailboxes to CSV
     .\SharedMailboxManager.ps1 -Step Export -CsvPath "C:\temp\SharedMailboxes.csv"
@@ -68,6 +73,14 @@
 .EXAMPLE
     # Export and import in one run
     .\SharedMailboxManager.ps1 -Step Both -CsvPath "C:\temp\SharedMailboxes.csv"
+
+.EXAMPLE
+    # Export with exclusion list (skip specific mailboxes)
+    .\SharedMailboxManager.ps1 -Step Export -CsvPath "C:\temp\SharedMailboxes.csv" -ExclusionListPath "C:\temp\ExcludeMailboxes.csv"
+
+.EXAMPLE
+    # Import with exclusion list
+    .\SharedMailboxManager.ps1 -Step Import -CsvPath "C:\temp\SharedMailboxes.csv" -ExclusionListPath "C:\temp\ExcludeMailboxes.csv"
 #>
 
 [CmdletBinding()]
@@ -89,7 +102,10 @@ param(
     [string]$SharePointListName = "Shared Mailboxes Mapping",
 
     [Parameter(Mandatory = $false)]
-    [switch]$TestMode
+    [switch]$TestMode,
+
+    [Parameter(Mandatory = $false)]
+    [string]$ExclusionListPath
 )
 
 # Set execution policy to allow running unsigned scripts (current process only)
@@ -183,6 +199,46 @@ function Disconnect-Services {
     try { Disconnect-PnPOnline -ErrorAction SilentlyContinue } catch { }
 }
 
+function Get-ExclusionList {
+    <#
+    .SYNOPSIS
+        Loads a list of shared mailbox addresses to exclude from a CSV file.
+        The CSV should have a single column with mailbox addresses (with or without a header).
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path $Path)) {
+        Write-Error "Exclusion list file not found: $Path"
+        throw "Exclusion list file not found: $Path"
+    }
+
+    $exclusions = @()
+
+    # Read the CSV content
+    $csvContent = Import-Csv -Path $Path
+
+    if ($csvContent -and $csvContent.Count -gt 0) {
+        # Get the first (and expected only) column name
+        $columnNames = $csvContent[0].PSObject.Properties.Name
+        if ($columnNames.Count -gt 0) {
+            $columnName = $columnNames[0]
+            $exclusions = $csvContent | ForEach-Object {
+                $_.$columnName.Trim().ToLower()
+            } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        }
+    }
+
+    Write-Host "Loaded $($exclusions.Count) mailbox(es) from exclusion list" -ForegroundColor Yellow
+    foreach ($addr in $exclusions) {
+        Write-Host "  Excluding: $addr" -ForegroundColor Yellow
+    }
+
+    return $exclusions
+}
+
 #endregion
 
 #region Step 1: Export Functions
@@ -244,7 +300,10 @@ function Export-SharedMailboxData {
     #>
     param(
         [Parameter(Mandatory = $true)]
-        [string]$OutputPath
+        [string]$OutputPath,
+
+        [Parameter(Mandatory = $false)]
+        [string[]]$ExclusionList = @()
     )
 
     Write-Host "Retrieving all shared mailboxes..." -ForegroundColor Cyan
@@ -255,7 +314,20 @@ function Export-SharedMailboxData {
         return
     }
 
-    Write-Host "Found $($sharedMailboxes.Count) shared mailboxes. Processing..." -ForegroundColor Green
+    Write-Host "Found $($sharedMailboxes.Count) shared mailboxes." -ForegroundColor Green
+
+    # Apply exclusion list
+    if ($ExclusionList -and $ExclusionList.Count -gt 0) {
+        $beforeCount = $sharedMailboxes.Count
+        $sharedMailboxes = $sharedMailboxes | Where-Object {
+            $_.PrimarySmtpAddress.ToLower() -notin $ExclusionList
+        }
+        $excludedCount = $beforeCount - @($sharedMailboxes).Count
+        Write-Host "Excluded $excludedCount mailbox(es) from exclusion list. Processing $(@($sharedMailboxes).Count) remaining..." -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "Processing..." -ForegroundColor Green
+    }
 
     $exportData = @()
     $counter = 0
@@ -592,7 +664,10 @@ function Import-AndProcessMailboxData {
         [string]$SharePointListName,
 
         [Parameter(Mandatory = $false)]
-        [bool]$TestMode = $false
+        [bool]$TestMode = $false,
+
+        [Parameter(Mandatory = $false)]
+        [string[]]$ExclusionList = @()
     )
 
     if (-not (Test-Path $CsvPath)) {
@@ -608,6 +683,16 @@ function Import-AndProcessMailboxData {
 
     Write-Host "Importing CSV data from: $CsvPath" -ForegroundColor Cyan
     $mailboxData = Import-Csv -Path $CsvPath
+
+    # Apply exclusion list
+    if ($ExclusionList -and $ExclusionList.Count -gt 0) {
+        $beforeCount = @($mailboxData).Count
+        $mailboxData = $mailboxData | Where-Object {
+            $_.'Mailbox address'.ToLower() -notin $ExclusionList
+        }
+        $excludedCount = $beforeCount - @($mailboxData).Count
+        Write-Host "Excluded $excludedCount mailbox(es) from exclusion list. $(@($mailboxData).Count) remaining." -ForegroundColor Yellow
+    }
 
     # Get existing SharePoint mappings to check for duplicates
     Write-Host "Checking for existing SharePoint mappings..." -ForegroundColor Cyan
@@ -742,6 +827,12 @@ try {
     Import-Module ExchangeOnlineManagement -ErrorAction Stop
     Import-Module PnP.PowerShell -ErrorAction Stop
 
+    # Load exclusion list if provided
+    $exclusionList = @()
+    if (-not [string]::IsNullOrWhiteSpace($ExclusionListPath)) {
+        $exclusionList = Get-ExclusionList -Path $ExclusionListPath
+    }
+
     # Validate ClientId is provided for Import/Both steps
     if ($Step -in @('Import', 'Both') -and [string]::IsNullOrWhiteSpace($ClientId)) {
         Write-Host ""
@@ -766,7 +857,7 @@ try {
             Connect-ExchangeOnlineService
 
             # Export shared mailbox data
-            Export-SharedMailboxData -OutputPath $CsvPath
+            Export-SharedMailboxData -OutputPath $CsvPath -ExclusionList $exclusionList
         }
 
         'Import' {
@@ -777,7 +868,7 @@ try {
             Connect-PnPService -SiteUrl $SharePointSiteUrl -ClientId $ClientId
 
             # Import and process
-            Import-AndProcessMailboxData -CsvPath $CsvPath -SharePointListName $SharePointListName -TestMode $TestMode.IsPresent
+            Import-AndProcessMailboxData -CsvPath $CsvPath -SharePointListName $SharePointListName -TestMode $TestMode.IsPresent -ExclusionList $exclusionList
         }
 
         'Both' {
@@ -788,10 +879,10 @@ try {
             Connect-PnPService -SiteUrl $SharePointSiteUrl -ClientId $ClientId
 
             # Export first
-            Export-SharedMailboxData -OutputPath $CsvPath
+            Export-SharedMailboxData -OutputPath $CsvPath -ExclusionList $exclusionList
 
             # Then import and process
-            Import-AndProcessMailboxData -CsvPath $CsvPath -SharePointListName $SharePointListName -TestMode $TestMode.IsPresent
+            Import-AndProcessMailboxData -CsvPath $CsvPath -SharePointListName $SharePointListName -TestMode $TestMode.IsPresent -ExclusionList $exclusionList
         }
     }
 
