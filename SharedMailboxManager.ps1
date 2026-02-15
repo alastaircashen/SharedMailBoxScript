@@ -19,7 +19,7 @@
        Update the -SharePointSiteUrl parameter to point to your SharePoint site.
        List requires two text columns: SharedMailbox, SecurityGroup
 
-    2. PNP APP REGISTRATION
+    2. PNP APP REGISTRATION (Interactive Mode)
        First, check if you have an existing PnP PowerShell app registration:
        - Go to Azure Portal > App Registrations > Search for "PnP"
        - Verify it has these DELEGATED permissions (not Application):
@@ -31,6 +31,14 @@
        Register-PnPEntraIDAppForInteractiveLogin -ApplicationName "PnP PowerShell" -Tenant yourtenant.onmicrosoft.com -Interactive
 
        See: https://pnp.github.io/powershell/articles/registerapplication.html
+
+    3. UNATTENDED MODE (Certificate-Based Auth)
+       For scheduled/automated runs without user interaction:
+       - Register an Azure AD app with APPLICATION permissions (not Delegated)
+       - Upload a certificate to the app registration
+       - Install the certificate on the machine running the script
+       - Assign the Exchange Administrator role to the app's service principal
+       - See ADMIN_GUIDE.md for detailed setup instructions
 
 .PARAMETER Step
     Specify which step to run: 'Export', 'Import', or 'Both'
@@ -58,6 +66,18 @@
     The CSV should have a single column with mailbox email addresses. A header row is expected
     (the column can have any name). Excluded mailboxes will be skipped during both export and import.
 
+.PARAMETER Unattended
+    Enables unattended (non-interactive) mode using certificate-based authentication.
+    Requires -ClientId, -TenantDomain, and -CertificateThumbprint parameters.
+
+.PARAMETER TenantDomain
+    The tenant domain (e.g. yourtenant.onmicrosoft.com). Required for unattended mode.
+
+.PARAMETER CertificateThumbprint
+    Thumbprint of the certificate used for app-only authentication. The certificate must be
+    installed in the local machine certificate store and uploaded to the Azure AD app registration.
+    Required for unattended mode.
+
 .EXAMPLE
     # Export shared mailboxes to CSV
     .\SharedMailboxManager.ps1 -Step Export -CsvPath "C:\temp\SharedMailboxes.csv"
@@ -81,6 +101,13 @@
 .EXAMPLE
     # Import with exclusion list
     .\SharedMailboxManager.ps1 -Step Import -CsvPath "C:\temp\SharedMailboxes.csv" -ExclusionListPath "C:\temp\ExcludeMailboxes.csv"
+
+.EXAMPLE
+    # Unattended mode - export and import with certificate-based auth (for scheduled tasks)
+    .\SharedMailboxManager.ps1 -Step Both -CsvPath "C:\temp\SharedMailboxes.csv" -Unattended `
+        -ClientId "your-app-client-id" `
+        -TenantDomain "yourtenant.onmicrosoft.com" `
+        -CertificateThumbprint "AB12CD34EF5678901234567890ABCDEF12345678"
 #>
 
 [CmdletBinding()]
@@ -105,7 +132,16 @@ param(
     [switch]$TestMode,
 
     [Parameter(Mandatory = $false)]
-    [string]$ExclusionListPath
+    [string]$ExclusionListPath,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$Unattended,
+
+    [Parameter(Mandatory = $false)]
+    [string]$TenantDomain,
+
+    [Parameter(Mandatory = $false)]
+    [string]$CertificateThumbprint
 )
 
 # Set execution policy to allow running unsigned scripts (current process only)
@@ -140,15 +176,35 @@ function Install-RequiredModules {
 function Connect-ExchangeOnlineService {
     <#
     .SYNOPSIS
-        Connects to Exchange Online.
+        Connects to Exchange Online. Supports interactive or certificate-based (unattended) auth.
     #>
+    param(
+        [Parameter(Mandatory = $false)]
+        [bool]$Unattended = $false,
+
+        [Parameter(Mandatory = $false)]
+        [string]$AppId,
+
+        [Parameter(Mandatory = $false)]
+        [string]$CertificateThumbprint,
+
+        [Parameter(Mandatory = $false)]
+        [string]$Organization
+    )
+
     Write-Host "Connecting to Exchange Online..." -ForegroundColor Cyan
     $connectionInfo = Get-ConnectionInformation -ErrorAction SilentlyContinue
     if ($connectionInfo) {
         Write-Host "Already connected to Exchange Online" -ForegroundColor Green
     }
     else {
-        Connect-ExchangeOnline -ShowBanner:$false
+        if ($Unattended) {
+            Write-Host "Using certificate-based authentication (unattended mode)" -ForegroundColor Yellow
+            Connect-ExchangeOnline -CertificateThumbprint $CertificateThumbprint -AppId $AppId -Organization $Organization -ShowBanner:$false
+        }
+        else {
+            Connect-ExchangeOnline -ShowBanner:$false
+        }
         $connectionInfo = Get-ConnectionInformation -ErrorAction SilentlyContinue
         if (-not $connectionInfo) {
             throw "Failed to connect to Exchange Online."
@@ -161,13 +217,23 @@ function Connect-PnPService {
     <#
     .SYNOPSIS
         Connects to PnP PowerShell for Microsoft 365 operations.
+        Supports interactive or certificate-based (unattended) auth.
     #>
     param(
         [Parameter(Mandatory = $true)]
         [string]$SiteUrl,
 
         [Parameter(Mandatory = $true)]
-        [string]$ClientId
+        [string]$ClientId,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$Unattended = $false,
+
+        [Parameter(Mandatory = $false)]
+        [string]$CertificateThumbprint,
+
+        [Parameter(Mandatory = $false)]
+        [string]$Tenant
     )
 
     Write-Host "Connecting to PnP PowerShell..." -ForegroundColor Cyan
@@ -184,8 +250,14 @@ function Connect-PnPService {
         # Not connected, proceed with connection
     }
 
-    # Connect with interactive login using registered app
-    Connect-PnPOnline -Url $SiteUrl -ClientId $ClientId -Interactive
+    if ($Unattended) {
+        Write-Host "Using certificate-based authentication (unattended mode)" -ForegroundColor Yellow
+        Connect-PnPOnline -Url $SiteUrl -ClientId $ClientId -Thumbprint $CertificateThumbprint -Tenant $Tenant
+    }
+    else {
+        # Connect with interactive login using registered app
+        Connect-PnPOnline -Url $SiteUrl -ClientId $ClientId -Interactive
+    }
     Write-Host "Successfully connected to PnP PowerShell" -ForegroundColor Green
 }
 
@@ -833,8 +905,30 @@ try {
         $exclusionList = Get-ExclusionList -Path $ExclusionListPath
     }
 
-    # Validate ClientId is provided for Import/Both steps
-    if ($Step -in @('Import', 'Both') -and [string]::IsNullOrWhiteSpace($ClientId)) {
+    # Validate unattended mode parameters
+    if ($Unattended) {
+        Write-Host "*** UNATTENDED MODE ***" -ForegroundColor Magenta
+        $missingParams = @()
+        if ([string]::IsNullOrWhiteSpace($ClientId)) { $missingParams += "ClientId" }
+        if ([string]::IsNullOrWhiteSpace($TenantDomain)) { $missingParams += "TenantDomain" }
+        if ([string]::IsNullOrWhiteSpace($CertificateThumbprint)) { $missingParams += "CertificateThumbprint" }
+
+        if ($missingParams.Count -gt 0) {
+            Write-Host ""
+            Write-Host "ERROR: Unattended mode requires these parameters: $($missingParams -join ', ')" -ForegroundColor Red
+            Write-Host ""
+            Write-Host "Example:" -ForegroundColor Yellow
+            Write-Host "  .\SharedMailboxManager.ps1 -Step Both -CsvPath 'C:\temp\SharedMailboxes.csv' -Unattended ```" -ForegroundColor Cyan
+            Write-Host "    -ClientId 'your-app-client-id' ```" -ForegroundColor Cyan
+            Write-Host "    -TenantDomain 'yourtenant.onmicrosoft.com' ```" -ForegroundColor Cyan
+            Write-Host "    -CertificateThumbprint 'AB12CD34EF56...' " -ForegroundColor Cyan
+            Write-Host ""
+            throw "Unattended mode requires -ClientId, -TenantDomain, and -CertificateThumbprint parameters."
+        }
+    }
+
+    # Validate ClientId is provided for Import/Both steps (interactive mode)
+    if (-not $Unattended -and $Step -in @('Import', 'Both') -and [string]::IsNullOrWhiteSpace($ClientId)) {
         Write-Host ""
         Write-Host "ERROR: ClientId is required for Import/Both steps." -ForegroundColor Red
         Write-Host ""
@@ -854,7 +948,7 @@ try {
     switch ($Step) {
         'Export' {
             # Connect to Exchange Online only
-            Connect-ExchangeOnlineService
+            Connect-ExchangeOnlineService -Unattended $Unattended.IsPresent -AppId $ClientId -CertificateThumbprint $CertificateThumbprint -Organization $TenantDomain
 
             # Export shared mailbox data
             Export-SharedMailboxData -OutputPath $CsvPath -ExclusionList $exclusionList
@@ -862,10 +956,10 @@ try {
 
         'Import' {
             # Connect to Exchange Online
-            Connect-ExchangeOnlineService
+            Connect-ExchangeOnlineService -Unattended $Unattended.IsPresent -AppId $ClientId -CertificateThumbprint $CertificateThumbprint -Organization $TenantDomain
 
             # Connect to PnP for Graph and SharePoint operations
-            Connect-PnPService -SiteUrl $SharePointSiteUrl -ClientId $ClientId
+            Connect-PnPService -SiteUrl $SharePointSiteUrl -ClientId $ClientId -Unattended $Unattended.IsPresent -CertificateThumbprint $CertificateThumbprint -Tenant $TenantDomain
 
             # Import and process
             Import-AndProcessMailboxData -CsvPath $CsvPath -SharePointListName $SharePointListName -TestMode $TestMode.IsPresent -ExclusionList $exclusionList
@@ -873,10 +967,10 @@ try {
 
         'Both' {
             # Connect to Exchange Online
-            Connect-ExchangeOnlineService
+            Connect-ExchangeOnlineService -Unattended $Unattended.IsPresent -AppId $ClientId -CertificateThumbprint $CertificateThumbprint -Organization $TenantDomain
 
             # Connect to PnP for Graph and SharePoint operations
-            Connect-PnPService -SiteUrl $SharePointSiteUrl -ClientId $ClientId
+            Connect-PnPService -SiteUrl $SharePointSiteUrl -ClientId $ClientId -Unattended $Unattended.IsPresent -CertificateThumbprint $CertificateThumbprint -Tenant $TenantDomain
 
             # Export first
             Export-SharedMailboxData -OutputPath $CsvPath -ExclusionList $exclusionList
