@@ -114,7 +114,7 @@ Add-Type -AssemblyName System.Web
 #region Module Installation and Connection Functions
 
 function Install-RequiredModules {
-<#
+    <#
     .SYNOPSIS
         Installs required PowerShell modules if not already installed.
     #>
@@ -135,7 +135,7 @@ function Install-RequiredModules {
 }
 
 function Connect-ExchangeOnlineService {
-<#
+    <#
     .SYNOPSIS
         Connects to Exchange Online.
     #>
@@ -178,7 +178,7 @@ function Connect-ExchangeOnlineService {
 }
 
 function Connect-PnPService {
-<#
+    <#
     .SYNOPSIS
         Connects to PnP PowerShell for Microsoft 365 operations.
     #>
@@ -203,7 +203,7 @@ function Connect-PnPService {
 
     Write-Host "Connecting to PnP PowerShell..." -ForegroundColor Cyan
 
-try {
+    try {
         # Check if already connected
         $currentConnection = Get-PnPConnection -ErrorAction SilentlyContinue
         if ($currentConnection -and $currentConnection.Url -eq $SiteUrl) {
@@ -227,7 +227,7 @@ try {
 }
 
 function Disconnect-Services {
-<#
+    <#
     .SYNOPSIS
         Disconnects from all services.
     #>
@@ -241,7 +241,7 @@ function Disconnect-Services {
 #region Step 1: Export Functions
 
 function Get-SharedMailboxSendPermissions {
-<#
+    <#
     .SYNOPSIS
         Gets all users with SendAs or SendOnBehalf permissions for a shared mailbox.
     #>
@@ -291,7 +291,7 @@ function Get-SharedMailboxSendPermissions {
 }
 
 function Export-SharedMailboxData {
-<#
+    <#
     .SYNOPSIS
         Exports all shared mailboxes and their permissions to a CSV file.
     #>
@@ -357,7 +357,7 @@ function Export-SharedMailboxData {
 #region Step 2: Import and Create Functions
 
 function Get-OrCreateSecurityGroup {
-<#
+    <#
     .SYNOPSIS
         Gets an existing security group or creates a new one using PnP PowerShell Graph API.
         If group exists, compares members to expected list.
@@ -476,7 +476,7 @@ function Get-OrCreateSecurityGroup {
 }
 
 function Add-UsersToSecurityGroup {
-<#
+    <#
     .SYNOPSIS
         Adds users to a security group using PnP PowerShell Graph API.
     #>
@@ -549,7 +549,7 @@ function Add-UsersToSecurityGroup {
 }
 
 function Get-ExistingSharePointMappings {
-<#
+    <#
     .SYNOPSIS
         Gets all existing mappings from the SharePoint list.
     #>
@@ -587,7 +587,7 @@ function Get-ExistingSharePointMappings {
 }
 
 function Update-SharePointList {
-<#
+    <#
     .SYNOPSIS
         Adds an item to the SharePoint list if the mailbox-group mapping doesn't already exist.
     #>
@@ -632,7 +632,7 @@ function Update-SharePointList {
 }
 
 function Import-AndProcessMailboxData {
-<#
+    <#
     .SYNOPSIS
         Imports CSV data and creates/syncs security groups for shared mailboxes.
         Ensures group membership matches mailbox permissions. Can be run repeatedly.
