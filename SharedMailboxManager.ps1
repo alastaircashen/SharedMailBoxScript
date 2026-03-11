@@ -80,7 +80,20 @@ param(
     [string]$CsvPath,
 
     [Parameter(Mandatory = $false)]
+    [ValidateSet("User", "App")]
+    [string]$AuthType = "App",
+
+    [Parameter(Mandatory = $false)]
     [string]$ClientId = "6042b520-90d0-4286-9192-fdbbe025740e",
+
+    [Parameter(Mandatory = $false)]
+    [string]$Thumbprint = "51a9424dbab8b935edcf69b183c6af1ae23b801c",
+
+    [Parameter(Mandatory = $false)]
+    [string]$TenantId = "d14ea1bf-9abf-4ed2-a166-32a5b8307d50",
+
+    [Parameter(Mandatory = $false)]
+    [string]$OrgAddress = "zn8r8.nsw.gov.au",
 
     [Parameter(Mandatory = $false)]
     [string]$SharePointSiteUrl = "https://zn8r8.sharepoint.com/sites/DMData",
@@ -101,7 +114,7 @@ Add-Type -AssemblyName System.Web
 #region Module Installation and Connection Functions
 
 function Install-RequiredModules {
-    <#
+<#
     .SYNOPSIS
         Installs required PowerShell modules if not already installed.
     #>
@@ -122,17 +135,40 @@ function Install-RequiredModules {
 }
 
 function Connect-ExchangeOnlineService {
-    <#
+<#
     .SYNOPSIS
         Connects to Exchange Online.
     #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("User", "App")]
+        [string]$AuthType,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ClientId,
+
+        [Parameter(Mandatory = $false)]
+        [string]$Thumbprint,
+
+        [Parameter(Mandatory = $false)]
+        [string]$OrgAddress
+
+    )
+
     Write-Host "Connecting to Exchange Online..." -ForegroundColor Cyan
     $connectionInfo = Get-ConnectionInformation -ErrorAction SilentlyContinue
     if ($connectionInfo) {
         Write-Host "Already connected to Exchange Online" -ForegroundColor Green
     }
     else {
-        Connect-ExchangeOnline -ShowBanner:$false
+        if ($AuthType -eq "User") {
+            Connect-ExchangeOnline -ShowBanner:$false
+        } elseif ($AuthType -eq "App") {
+            Connect-ExchangeOnline -AppID $ClientId -CertificateThumbPrint $Thumbprint -Organization $OrgAddress -ShowBanner:$false
+        } else {
+            try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue } catch { }
+        }
+
         $connectionInfo = Get-ConnectionInformation -ErrorAction SilentlyContinue
         if (-not $connectionInfo) {
             throw "Failed to connect to Exchange Online."
@@ -142,7 +178,7 @@ function Connect-ExchangeOnlineService {
 }
 
 function Connect-PnPService {
-    <#
+<#
     .SYNOPSIS
         Connects to PnP PowerShell for Microsoft 365 operations.
     #>
@@ -151,12 +187,23 @@ function Connect-PnPService {
         [string]$SiteUrl,
 
         [Parameter(Mandatory = $true)]
-        [string]$ClientId
+        [ValidateSet("User", "App")]
+        [string]$AuthType,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ClientId,
+
+        [Parameter(Mandatory = $false)]
+        [string]$Thumbprint,
+
+        [Parameter(Mandatory = $false)]
+        [string]$TenantId
+
     )
 
     Write-Host "Connecting to PnP PowerShell..." -ForegroundColor Cyan
 
-    try {
+try {
         # Check if already connected
         $currentConnection = Get-PnPConnection -ErrorAction SilentlyContinue
         if ($currentConnection -and $currentConnection.Url -eq $SiteUrl) {
@@ -169,12 +216,18 @@ function Connect-PnPService {
     }
 
     # Connect with interactive login using registered app
-    Connect-PnPOnline -Url $SiteUrl -ClientId $ClientId -Interactive
+    if ($AuthType -eq "User") {
+        Connect-PnPOnline -Url $SiteUrl -ClientId $ClientId -Interactive
+    } elseif ($AuthType -eq "App") {
+        Connect-PnPOnline -Url $SiteUrl -ClientId $ClientId -Tenant $TenantId -Thumbprint $Thumbprint
+    } else {
+        Disconnect-PnPOnline
+    }
     Write-Host "Successfully connected to PnP PowerShell" -ForegroundColor Green
 }
 
 function Disconnect-Services {
-    <#
+<#
     .SYNOPSIS
         Disconnects from all services.
     #>
@@ -188,7 +241,7 @@ function Disconnect-Services {
 #region Step 1: Export Functions
 
 function Get-SharedMailboxSendPermissions {
-    <#
+<#
     .SYNOPSIS
         Gets all users with SendAs or SendOnBehalf permissions for a shared mailbox.
     #>
@@ -238,7 +291,7 @@ function Get-SharedMailboxSendPermissions {
 }
 
 function Export-SharedMailboxData {
-    <#
+<#
     .SYNOPSIS
         Exports all shared mailboxes and their permissions to a CSV file.
     #>
@@ -304,7 +357,7 @@ function Export-SharedMailboxData {
 #region Step 2: Import and Create Functions
 
 function Get-OrCreateSecurityGroup {
-    <#
+<#
     .SYNOPSIS
         Gets an existing security group or creates a new one using PnP PowerShell Graph API.
         If group exists, compares members to expected list.
@@ -423,7 +476,7 @@ function Get-OrCreateSecurityGroup {
 }
 
 function Add-UsersToSecurityGroup {
-    <#
+<#
     .SYNOPSIS
         Adds users to a security group using PnP PowerShell Graph API.
     #>
@@ -496,7 +549,7 @@ function Add-UsersToSecurityGroup {
 }
 
 function Get-ExistingSharePointMappings {
-    <#
+<#
     .SYNOPSIS
         Gets all existing mappings from the SharePoint list.
     #>
@@ -534,7 +587,7 @@ function Get-ExistingSharePointMappings {
 }
 
 function Update-SharePointList {
-    <#
+<#
     .SYNOPSIS
         Adds an item to the SharePoint list if the mailbox-group mapping doesn't already exist.
     #>
@@ -579,7 +632,7 @@ function Update-SharePointList {
 }
 
 function Import-AndProcessMailboxData {
-    <#
+<#
     .SYNOPSIS
         Imports CSV data and creates/syncs security groups for shared mailboxes.
         Ensures group membership matches mailbox permissions. Can be run repeatedly.
@@ -763,7 +816,7 @@ try {
     switch ($Step) {
         'Export' {
             # Connect to Exchange Online only
-            Connect-ExchangeOnlineService
+            Connect-ExchangeOnlineService -AuthType $AuthType -ClientId $ClientId -Thumbprint $Thumbprint -OrgAddress $OrgAddress
 
             # Export shared mailbox data
             Export-SharedMailboxData -OutputPath $CsvPath
@@ -771,10 +824,10 @@ try {
 
         'Import' {
             # Connect to Exchange Online
-            Connect-ExchangeOnlineService
+            Connect-ExchangeOnlineService -AuthType $AuthType -ClientId $ClientId -Thumbprint $Thumbprint -OrgAddress $OrgAddress
 
             # Connect to PnP for Graph and SharePoint operations
-            Connect-PnPService -SiteUrl $SharePointSiteUrl -ClientId $ClientId
+            Connect-PnPService -SiteUrl $SharePointSiteUrl -AuthType $AuthType -ClientId $ClientId -TenantId $TenantId -Thumbprint $Thumbprint
 
             # Import and process
             Import-AndProcessMailboxData -CsvPath $CsvPath -SharePointListName $SharePointListName -TestMode $TestMode.IsPresent
@@ -782,10 +835,10 @@ try {
 
         'Both' {
             # Connect to Exchange Online
-            Connect-ExchangeOnlineService
+            Connect-ExchangeOnlineService -AuthType $AuthType -ClientId $ClientId -Thumbprint $Thumbprint -OrgAddress $OrgAddress
 
             # Connect to PnP for Graph and SharePoint operations
-            Connect-PnPService -SiteUrl $SharePointSiteUrl -ClientId $ClientId
+            Connect-PnPService -SiteUrl $SharePointSiteUrl -AuthType $AuthType -ClientId $ClientId -TenantId $TenantId -Thumbprint $Thumbprint
 
             # Export first
             Export-SharedMailboxData -OutputPath $CsvPath
